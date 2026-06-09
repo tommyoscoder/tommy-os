@@ -1,0 +1,18 @@
+@echo off
+setlocal
+echo ==================================================
+echo   Tommy OS v1.5  -  Install to physical drive
+echo   !! WARNING: this ERASES the chosen drive !!
+echo ==================================================
+echo.
+
+if not exist build\tommy_os.img (
+    echo [ERROR] build\tommy_os.img not found.
+    echo         Run build.bat first.
+    pause
+    exit /b 1
+)
+
+REM Hand off to PowerShell installer for safer drive listing and writing.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0install_to_drive.ps1"
+exit /b %errorlevel%

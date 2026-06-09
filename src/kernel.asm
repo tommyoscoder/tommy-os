@@ -1,0 +1,8148 @@
+; ============================================================
+; Tommy OS - Kernel, Shell, Editor, Graphics
+; Loaded at linear 0x8000 (segment 0x0800, offset 0x0000)
+; ============================================================
+[BITS 16]
+[ORG 0x0000]
+
+; ---- Constants ----
+VGA_MEM        equ 0xB800
+SCREEN_W       equ 80
+SCREEN_H       equ 25
+MAX_CMD        equ 128
+MAX_ED_LINES   equ 150
+ED_LINE_LEN    equ 78
+SCRL_MAX       equ 10          ; terminal scrollback lines
+
+; Colour attributes
+COL_NORMAL     equ 0x07
+COL_BRIGHT     equ 0x0F
+COL_GREEN      equ 0x0A
+COL_CYAN       equ 0x0B
+COL_YELLOW     equ 0x0E
+COL_RED        equ 0x0C
+COL_MAGENTA    equ 0x0D   ; bright magenta
+COL_TITLE      equ 0x4F   ; white on red
+COL_STATUS     equ 0x30   ; black on cyan
+
+; ============================================================
+; ENTRY POINT
+; ============================================================
+kernel_main:
+    mov ax, cs
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov sp, 0xFFFE
+    mov [boot_drive], dl
+
+    mov ax, 0x0003          ; text mode 80x25
+    int 0x10
+    mov ah, 0x01            ; hide cursor
+    mov cx, 0x2607
+    int 0x10
+
+    call clrscr
+
+    call disk_init
+    call check_first_boot
+    test al, al
+    jz .do_setup
+    call show_login
+    jmp .shell
+
+.do_setup:
+    call first_boot_setup
+
+.shell:
+    call shell_main
+
+.halt:
+    hlt
+    jmp .halt
+
+; ============================================================
+; CHECK FIRST BOOT — returns AL=0 if not configured
+;   Tries to load config from disk; if magic matches, we're configured.
+; ============================================================
+check_first_boot:
+    call load_config_from_disk
+    cmp byte [cfg_magic], 0xAB
+    jne .no
+    mov al, 1
+    ret
+.no:
+    xor al, al
+    ret
+
+; ============================================================
+; FIRST BOOT SETUP WIZARD
+; ============================================================
+first_boot_setup:
+    call clrscr
+    call draw_titlebar
+
+    mov dh, 3
+    mov dl, 20
+    mov bl, COL_YELLOW
+    mov si, str_welcome_big
+    call print_at
+
+    mov dh, 5
+    mov dl, 15
+    mov bl, COL_CYAN
+    mov si, str_welcome_sub
+    call print_at
+
+    mov dh, 7
+    mov dl, 0
+    mov bl, COL_YELLOW
+    mov cx, 80
+    mov al, 0xCD
+    call draw_hline
+
+    ; -- Name --
+    mov dh, 9
+    mov dl, 4
+    mov bl, COL_BRIGHT
+    mov si, str_ask_name
+    call print_at
+
+    mov dh, 9
+    mov dl, 37
+    call setcursor
+    mov di, username
+    mov cx, 31
+    call readline_echo
+
+    ; -- Password --
+    mov dh, 11
+    mov dl, 4
+    mov bl, COL_BRIGHT
+    mov si, str_ask_pass
+    call print_at
+
+    mov dh, 11
+    mov dl, 37
+    call setcursor
+    mov di, password
+    mov cx, 31
+    call readline_noecho
+
+    mov dh, 11
+    mov dl, 37
+    mov bl, COL_YELLOW
+    mov si, str_pass_set
+    call print_at
+
+    ; -- Drives --
+    call enum_drives
+
+    ; -- Drive choice --
+    mov dh, 19
+    mov dl, 4
+    mov bl, COL_BRIGHT
+    mov si, str_ask_drive
+    call print_at
+
+    mov dh, 19
+    mov dl, 37
+    call setcursor
+    mov di, drive_choice
+    mov cx, 3
+    call readline_echo
+
+    ; -- Confirm --
+    mov dh, 21
+    mov dl, 4
+    mov bl, COL_RED
+    mov si, str_confirm
+    call print_at
+
+    mov dh, 21
+    mov dl, 30
+    call setcursor
+    mov ah, 0x00
+    int 0x16
+    cmp al, 'y'
+    je .do_install
+    cmp al, 'Y'
+    je .do_install
+    jmp .installed
+
+.do_install:
+    mov byte [cfg_magic], 0xAB
+    mov si, username
+    mov di, cfg_username
+    mov cx, 33
+    rep movsb
+
+    ; Hash (password + username salt) -> cfg_pwhash
+    mov word [hp_pw_ptr], password
+    mov word [hp_un_ptr], username
+    call hash_password
+    mov eax, [hp_result]
+    mov [cfg_pwhash], eax
+
+    ; Wipe plaintext password from RAM
+    mov di, password
+    mov cx, 33
+    xor al, al
+    rep stosb
+
+    ; Persist config to LBA 64 (best-effort; ignore failure)
+    call save_config_to_disk
+    jmp .installed
+
+.installed:
+    mov byte [cfg_magic], 0xAB  ; always mark installed
+
+    call clrscr
+    call draw_titlebar
+
+    mov dh, 10
+    mov dl, 24
+    mov bl, COL_GREEN
+    mov si, str_install_ok
+    call print_at
+
+    mov dh, 12
+    mov dl, 22
+    mov bl, COL_BRIGHT
+    mov si, str_press_enter
+    call print_at
+
+    call wait_enter
+    ret
+
+; ============================================================
+; ENUMERATE DRIVES (shows drive number, kind, and size in MB so
+; the user can tell their USB stick from the boot disk).
+; ============================================================
+enum_drives:
+    mov dh, 13
+    mov dl, 4
+    mov bl, COL_YELLOW
+    mov si, str_drives_hdr
+    call print_at
+
+    mov byte [drv_row], 14
+
+    ; Floppies (BIOS DL 0x00, 0x01)
+    mov byte [drv_cur], 0x00
+.fdd_loop:
+    mov dl, [drv_cur]
+    call query_drive
+    jc .fdd_skip
+    mov al, [drv_cur]
+    mov bl, 0                  ; 0 = floppy label
+    call print_drive_line
+.fdd_skip:
+    inc byte [drv_cur]
+    cmp byte [drv_cur], 0x02
+    jne .fdd_loop
+
+    ; Hard / USB drives (BIOS DL 0x80..0x83)
+    mov byte [drv_cur], 0x80
+.hdd_loop:
+    mov dl, [drv_cur]
+    call query_drive
+    jc .hdd_skip
+    mov al, [drv_cur]
+    mov bl, 1                  ; 1 = hard/usb label
+    call print_drive_line
+.hdd_skip:
+    inc byte [drv_cur]
+    cmp byte [drv_cur], 0x84
+    jne .hdd_loop
+    ret
+
+; ----- print_drive_line: AL = BIOS drive #, BL = 0 (fdd) or 1 (hdd)
+;       EAX (from query_drive) = MB size — pulled from cached var.
+print_drive_line:
+    push ax
+    push bx
+    push cx
+    push dx
+
+    mov dh, [drv_row]
+
+    ; "  drive "
+    mov dl, 2
+    mov bl, COL_GREEN
+    mov si, str_drv_pre
+    call print_at
+
+    ; drive number (for HDDs, show 0..3 instead of 0x80..)
+    mov dh, [drv_row]
+    mov dl, 10
+    call setcursor
+    pop dx
+    push dx
+    pop ax                     ; restore AL = BIOS drive number
+    push ax
+    cmp al, 0x80
+    jb .as_is
+    sub al, 0x80
+.as_is:
+    add al, '0'
+    call putc_at_cursor
+
+    ; "  " kind label
+    mov al, ' '
+    call putc_at_cursor
+    mov al, ' '
+    call putc_at_cursor
+    pop ax
+    push ax
+    cmp al, 0x80
+    jae .hdd_kind
+    mov si, str_drv_fdd
+    jmp .kind_done
+.hdd_kind:
+    mov si, str_drv_hdd
+.kind_done:
+    call print_str_at_cursor
+
+    ; size in MB, right-aligned-ish at col 28
+    mov dh, [drv_row]
+    mov dl, 28
+    call setcursor
+    mov eax, [drv_size_mb]
+    cmp eax, 0
+    jne .has_size
+    mov si, str_drv_unknown
+    call print_str_at_cursor
+    jmp .size_done
+.has_size:
+    ; print EAX as decimal (32-bit)
+    call print_dec_eax_at_cursor
+    mov si, str_drv_mb
+    call print_str_at_cursor
+.size_done:
+
+    inc byte [drv_row]
+
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; ----- query_drive: DL = BIOS drive number
+;   Output: CF=0 if drive exists, EAX = approx MB, also in [drv_size_mb]
+;           CF=1 if drive doesn't respond.
+;   Uses INT 13h AH=48h (extended drive params) when available,
+;   falls back to AH=08h CHS.
+query_drive:
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push es
+    push ds
+
+    push cs
+    pop ds                  ; DS = CS for our locals/buffer
+
+    mov [q_dl], dl
+    mov dword [drv_size_mb], 0
+
+    ; Step 1: existence test via AH=08h. NOTE: int 13h AH=08h
+    ; CLOBBERS DL (returns drive count) and DH (returns max head),
+    ; so we cache the returns immediately and reload DL from q_dl.
+    xor di, di
+    mov es, di
+    mov ah, 0x08
+    mov dl, [q_dl]
+    int 0x13
+    jc .none
+
+    ; Cache CHS values (max cyl, max head, spt) from the BIOS regs.
+    ;   CH      = cyl low 8 bits
+    ;   CL[7:6] = cyl high 2 bits
+    ;   CL[5:0] = sectors-per-track
+    ;   DH      = max head
+    mov [q_max_cyl_lo], ch
+    mov [q_max_head], dh
+    mov al, cl
+    rol al, 2
+    and al, 0x03
+    mov [q_max_cyl_hi], al
+    mov al, cl
+    and al, 0x3F
+    mov [q_spt], al
+
+    ; For floppies (DL < 0x80), use CHS directly (AH=48h unreliable).
+    cmp byte [q_dl], 0x80
+    jb .from_chs
+
+    ; Step 2: AH=48h for HDD/USB (accurate even on > 8 GB drives)
+    mov word [ext_buf], 30
+    mov si, ext_buf
+    mov ah, 0x48
+    mov dl, [q_dl]
+    int 0x13
+    jc .from_chs
+
+    mov eax, [ext_buf+16]
+    cmp eax, 0
+    je .from_chs
+    shr eax, 11
+    mov [drv_size_mb], eax
+    jmp .ok
+
+.from_chs:
+    ; total = (max_cyl+1) * (max_head+1) * spt
+    movzx eax, byte [q_max_cyl_lo]
+    movzx ebx, byte [q_max_cyl_hi]
+    shl ebx, 8
+    or eax, ebx
+    inc eax                 ; cyls
+    movzx ebx, byte [q_max_head]
+    inc ebx
+    mul ebx
+    movzx ebx, byte [q_spt]
+    mul ebx
+    shr eax, 11
+    ; Floppies smaller than 1 MB should still show as 1 MB so the
+    ; user sees them in the list.
+    cmp eax, 0
+    jne .have
+    mov eax, 1
+.have:
+    mov [drv_size_mb], eax
+.ok:
+    pop ds
+    pop es
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    clc
+    ret
+.none:
+    pop ds
+    pop es
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    stc
+    ret
+
+; ----- print_dec_eax_at_cursor: print EAX (unsigned 32-bit) as
+;       decimal at current cursor.
+print_dec_eax_at_cursor:
+    push eax
+    push ebx
+    push ecx
+    push edx
+
+    mov ecx, 0
+    mov ebx, 10
+    cmp eax, 0
+    jne .pd_loop
+    mov al, '0'
+    call putc_at_cursor
+    jmp .pd_done
+.pd_loop:
+    cmp eax, 0
+    je .pd_emit
+    xor edx, edx
+    div ebx
+    push edx
+    inc ecx
+    jmp .pd_loop
+.pd_emit:
+    cmp ecx, 0
+    je .pd_done
+    pop eax
+    add al, '0'
+    call putc_at_cursor
+    dec ecx
+    jmp .pd_emit
+.pd_done:
+    pop edx
+    pop ecx
+    pop ebx
+    pop eax
+    ret
+
+; ============================================================
+; SHOW LOGIN
+; ============================================================
+show_login:
+    call clrscr
+    call draw_titlebar
+
+    mov dh, 3
+    mov dl, 20
+    mov bl, COL_YELLOW
+    mov si, str_logo1
+    call print_at
+
+    mov dh, 4
+    mov dl, 20
+    mov bl, COL_BRIGHT
+    mov si, str_logo2
+    call print_at
+
+    mov dh, 5
+    mov dl, 20
+    mov bl, COL_CYAN
+    mov si, str_logo3
+    call print_at
+
+    mov dh, 6
+    mov dl, 20
+    mov bl, COL_YELLOW
+    mov si, str_logo4
+    call print_at
+
+    mov dh, 8
+    mov dl, 0
+    mov bl, COL_YELLOW
+    mov cx, 80
+    mov al, 0xCD
+    call draw_hline
+
+    mov dh, 10
+    mov dl, 28
+    mov bl, COL_YELLOW
+    mov si, str_no_wifi
+    call print_at
+
+    mov dh, 12
+    mov dl, 4
+    mov bl, COL_YELLOW
+    mov si, str_welcome_back
+    call print_at
+
+    mov dh, 12
+    mov dl, 24
+    mov bl, COL_GREEN
+    mov si, cfg_username
+    call print_at
+
+    mov dh, 14
+    mov dl, 4
+    mov bl, COL_BRIGHT
+    mov si, str_login_user
+    call print_at
+
+    mov dh, 14
+    mov dl, 16
+    call setcursor
+    mov di, login_buf
+    mov cx, 31
+    call readline_echo
+
+    mov dh, 16
+    mov dl, 4
+    mov bl, COL_BRIGHT
+    mov si, str_login_pass
+    call print_at
+
+    mov dh, 16
+    mov dl, 16
+    call setcursor
+    mov di, login_buf
+    mov cx, 31
+    call readline_noecho
+
+    ; Hash the entered password (salted with stored username), compare to cfg_pwhash
+    mov word [hp_pw_ptr], login_buf
+    mov word [hp_un_ptr], cfg_username
+    call hash_password
+
+    ; Compare hash, then wipe login_buf either way
+    mov eax, [hp_result]
+    cmp eax, [cfg_pwhash]
+    pushf
+    mov di, login_buf
+    mov cx, 33
+    xor al, al
+    rep stosb
+    popf
+    je .ok
+
+    mov dh, 18
+    mov dl, 4
+    mov bl, COL_RED
+    mov si, str_wrong_pass
+    call print_at
+    call wait_enter
+    jmp show_login
+
+.ok:
+    ret
+
+; ============================================================
+; SHELL MAIN LOOP
+; ============================================================
+shell_main:
+    call clrscr
+    call draw_titlebar
+    call draw_statusbar
+
+    mov dh, 2
+    mov dl, 0
+    mov bl, COL_GREEN
+    mov si, str_shell_greet
+    call print_at
+
+    mov dh, 3
+    mov dl, 0
+    mov bl, COL_NORMAL
+    mov si, str_shell_hint
+    call print_at
+
+    mov dh, 4
+    mov dl, 0
+    mov bl, COL_CYAN
+    mov cx, 80
+    mov al, 0xC4
+    call draw_hline
+
+    mov byte [sh_row], 6
+
+.loop:
+    call shell_prompt
+
+    mov di, cmd_buf
+    mov cx, MAX_CMD - 1
+    mov byte [hist_enabled], 1
+    mov byte [hist_view], 0
+    call readline_echo
+    mov byte [hist_enabled], 0
+
+    mov di, cmd_buf
+    call hist_push
+
+    call exec_cmd
+    jmp .loop
+
+; ============================================================
+; SHELL PROMPT
+; ============================================================
+shell_prompt:
+    movzx ax, byte [sh_row]
+    cmp ax, SCREEN_H - 3
+    jl .ok
+    call shell_scroll
+.ok:
+    ; Write "TOMMY> " directly to VGA
+    push es
+    mov ax, VGA_MEM
+    mov es, ax
+    movzx bx, byte [sh_row]
+    imul bx, bx, SCREEN_W * 2
+
+    mov word [es:bx+0],  0x0C54   ; T - bright red
+    mov word [es:bx+2],  0x0E4F   ; O - bright yellow
+    mov word [es:bx+4],  0x0A4D   ; M - bright green
+    mov word [es:bx+6],  0x0B4D   ; M - bright cyan
+    mov word [es:bx+8],  0x0D59   ; Y - bright magenta
+    mov word [es:bx+10], 0x0F3E   ; > - bright white
+    mov word [es:bx+12], 0x0720   ; space
+    pop es
+
+    mov dh, [sh_row]
+    mov dl, 7
+    call setcursor
+    ret
+
+; ============================================================
+; EXECUTE COMMAND
+; ============================================================
+exec_cmd:
+    mov si, cmd_buf
+    call skip_spaces
+
+    cmp byte [si], 0
+    je .done
+
+    mov di, s_help
+    call cmd_match
+    je .do_help
+
+    mov di, s_clear
+    call cmd_match
+    je .do_clear
+
+    mov di, s_cls
+    call cmd_match
+    je .do_clear
+
+    mov di, s_ver
+    call cmd_match
+    je .do_ver
+
+    mov di, s_about
+    call cmd_match
+    je .do_about
+
+    mov di, s_whoami
+    call cmd_match
+    je .do_whoami
+
+    mov di, s_echo
+    call cmd_match
+    je .do_echo
+
+    mov di, s_ls
+    call cmd_match
+    je .do_ls
+
+    mov di, s_edit
+    call cmd_match
+    je .do_edit
+
+    mov di, s_asm
+    call cmd_match
+    je .do_asm
+
+    mov di, s_mem
+    call cmd_match
+    je .do_mem
+
+    mov di, s_gfx
+    call cmd_match
+    je .do_graphics
+
+    mov di, s_graphics
+    call cmd_match
+    je .do_graphics
+
+    mov di, s_date
+    call cmd_match
+    je .do_date
+
+    mov di, s_time
+    call cmd_match
+    je .do_time
+
+    mov di, s_uptime
+    call cmd_match
+    je .do_uptime
+
+    mov di, s_random
+    call cmd_match
+    je .do_random
+
+    mov di, s_beep
+    call cmd_match
+    je .do_beep
+
+    mov di, s_color
+    call cmd_match
+    je .do_color
+
+    mov di, s_sysinfo
+    call cmd_match
+    je .do_sysinfo
+
+    mov di, s_cpuid
+    call cmd_match
+    je .do_cpuid
+
+    mov di, s_calc
+    call cmd_match
+    je .do_calc
+
+    mov di, s_snake
+    call cmd_match
+    je .do_snake
+
+    mov di, s_reboot
+    call cmd_match
+    je .do_reboot
+
+    mov di, s_shutdown
+    call cmd_match
+    je .do_shutdown
+
+    mov di, s_run
+    call cmd_match
+    je .do_tc_run
+
+    mov di, s_tc
+    call cmd_match
+    je .do_tc_run
+
+    mov di, s_manual
+    call cmd_match
+    je .do_manual
+
+    mov di, s_save
+    call cmd_match
+    je .do_save
+
+    mov di, s_load
+    call cmd_match
+    je .do_load
+
+    mov di, s_dir
+    call cmd_match
+    je .do_dir
+
+    mov di, s_cat
+    call cmd_match
+    je .do_cat
+
+    mov di, s_del
+    call cmd_match
+    je .do_del
+
+    mov di, s_write
+    call cmd_match
+    je .do_write
+
+    mov di, s_read
+    call cmd_match
+    je .do_read
+
+    mov di, s_df
+    call cmd_match
+    je .do_df
+
+    mov di, s_fsinit
+    call cmd_match
+    je .do_fsinit
+
+    mov di, s_hist
+    call cmd_match
+    je .do_hist
+
+    mov di, s_hist2
+    call cmd_match
+    je .do_hist
+
+    mov di, s_clock
+    call cmd_match
+    je .do_clock
+
+    mov di, s_hex
+    call cmd_match
+    je .do_hex
+
+    mov di, s_ttt
+    call cmd_match
+    je .do_ttt
+
+    mov di, s_tictactoe
+    call cmd_match
+    je .do_ttt
+
+    mov di, s_motd
+    call cmd_match
+    je .do_motd
+
+    mov di, s_rename
+    call cmd_match
+    je .do_rename
+
+    mov di, s_kedit
+    call cmd_match
+    je .do_kedit
+
+    mov di, s_ide
+    call cmd_match
+    je .do_ide
+
+    ; Unknown
+    call sh_newline
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_RED
+    mov si, str_unknown
+    call print_at
+    call sh_newline
+    jmp .done
+
+.do_help:
+    call sh_newline
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_YELLOW
+    mov si, str_help_title
+    call print_at
+    call sh_newline
+    mov si, str_help_body
+.help_loop:
+    cmp byte [si], 0
+    je .help_done
+    mov dh, [sh_row]
+    mov dl, 2
+    mov bl, COL_NORMAL
+    call print_line_si       ; prints until 0x0A or 0
+    call sh_newline
+    jmp .help_loop
+.help_done:
+    call sh_newline
+    jmp .done
+
+.do_clear:
+    call clrscr
+    call draw_titlebar
+    call draw_statusbar
+
+    mov dh, 2
+    mov dl, 0
+    mov bl, COL_GREEN
+    mov si, str_shell_greet
+    call print_at
+
+    mov dh, 3
+    mov dl, 0
+    mov bl, COL_NORMAL
+    mov si, str_shell_hint
+    call print_at
+
+    mov dh, 4
+    mov dl, 0
+    mov bl, COL_CYAN
+    mov cx, 80
+    mov al, 0xC4
+    call draw_hline
+
+    mov byte [sh_row], 6
+    jmp .done
+
+.do_ver:
+    call sh_newline
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_CYAN
+    mov si, str_ver
+    call print_at
+    call sh_newline
+    jmp .done
+
+.do_whoami:
+    call sh_newline
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_GREEN
+    mov si, cfg_username
+    call print_at
+    call sh_newline
+    jmp .done
+
+.do_echo:
+    ; Skip "echo "
+    mov si, cmd_buf
+    call skip_spaces
+    add si, 4
+    call skip_spaces
+    call sh_newline
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_NORMAL
+    call print_at
+    call sh_newline
+    jmp .done
+
+.do_ls:
+    call sh_newline
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_CYAN
+    mov si, str_ls
+    call print_at
+    call sh_newline
+    call sh_newline
+    jmp .done
+
+.do_edit:
+    ; If a filename argument follows "edit", load that file first
+    call skip_first_word
+    call arg_after_cmd
+    cmp byte [arg_name], 0
+    je .edit_open
+    call fs_ensure_mounted
+    mov si, arg_name
+    call fs_find
+    jne .edit_open              ; file not found: still open editor (new file)
+    push ax
+    push di
+    push cx
+    mov di, ed_buf
+    mov cx, MAX_ED_LINES * ED_LINE_LEN
+    xor al, al
+    rep stosb
+    pop cx
+    pop di
+    pop ax
+    call fs_read_slot
+    call tc_recount_lines
+.edit_open:
+    call text_editor
+    call clrscr
+    call draw_titlebar
+    call draw_statusbar
+    mov dh, 2
+    mov dl, 0
+    mov bl, COL_GREEN
+    mov si, str_shell_greet
+    call print_at
+    mov dh, 3
+    mov dl, 0
+    mov bl, COL_NORMAL
+    mov si, str_shell_hint
+    call print_at
+    mov dh, 4
+    mov dl, 0
+    mov bl, COL_CYAN
+    mov cx, 80
+    mov al, 0xC4
+    call draw_hline
+    mov byte [sh_row], 6
+    ; If user hit Ctrl-R inside the editor, run the program right away.
+    cmp byte [ed_exit_run], 1
+    jne .done
+    mov byte [ed_exit_run], 0
+    call tc_run
+    jmp .done
+
+.do_asm:
+    call sh_newline
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_GREEN
+    mov si, str_asm
+    call print_at
+    call sh_newline
+    call sh_newline
+    jmp .done
+
+.do_mem:
+    call sh_newline
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_CYAN
+    mov si, str_mem
+    call print_at
+    call sh_newline
+    call sh_newline
+    jmp .done
+
+.do_graphics:
+    call graphics_mode
+    call clrscr
+    call draw_titlebar
+    call draw_statusbar
+    mov byte [sh_row], 6
+    jmp .done
+
+.do_about:
+    call sh_newline
+    mov si, str_about
+    mov bl, COL_CYAN
+    call sh_print_multiline
+    call sh_newline
+    jmp .done
+
+.do_sysinfo:
+    call sh_newline
+    call cmd_sysinfo
+    jmp .done
+
+.do_cpuid:
+    call sh_newline
+    call cmd_cpuid
+    jmp .done
+
+.do_calc:
+    call sh_newline
+    call cmd_calc
+    jmp .done
+
+.do_snake:
+    call gfx_app_snake_entry
+    call clrscr
+    call draw_titlebar
+    call draw_statusbar
+    mov byte [sh_row], 6
+    jmp .done
+
+.do_date:
+    call sh_newline
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_BRIGHT
+    mov si, str_date_l
+    call print_at
+    mov dh, [sh_row]
+    mov dl, 16                  ; len of "  Date (Y-M-D): "
+    call setcursor
+    ; BIOS get RTC date: AH=04h, CX=YYYY (BCD), DH=MM, DL=DD
+    mov ah, 0x04
+    int 0x1A
+    push dx
+    push cx
+    mov al, ch                  ; century BCD
+    call print_bcd_at_cursor
+    pop cx
+    push cx
+    mov al, cl                  ; year-in-century BCD
+    call print_bcd_at_cursor
+    mov al, '-'
+    call putc_at_cursor
+    pop cx
+    pop dx
+    mov al, dh
+    call print_bcd_at_cursor
+    mov al, '-'
+    call putc_at_cursor
+    mov al, dl
+    call print_bcd_at_cursor
+    call sh_newline
+    jmp .done
+
+.do_time:
+    call sh_newline
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_BRIGHT
+    mov si, str_time_l
+    call print_at
+    mov dh, [sh_row]
+    mov dl, 16                  ; len of "  Time (H:M:S): "
+    call setcursor
+    ; BIOS get RTC time: AH=02h, CH=HH, CL=MM, DH=SS (BCD)
+    mov ah, 0x02
+    int 0x1A
+    push dx
+    mov al, ch
+    call print_bcd_at_cursor
+    mov al, ':'
+    call putc_at_cursor
+    mov al, cl
+    call print_bcd_at_cursor
+    mov al, ':'
+    call putc_at_cursor
+    pop dx
+    mov al, dh
+    call print_bcd_at_cursor
+    call sh_newline
+    jmp .done
+
+.do_uptime:
+    call sh_newline
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_BRIGHT
+    mov si, str_uptime_l
+    call print_at
+    mov dh, [sh_row]
+    mov dl, 24                  ; len of "  Ticks since midnight: "
+    call setcursor
+    ; BIOS tick count: AH=00, returns CX:DX
+    xor ax, ax
+    int 0x1A
+    mov ax, dx
+    call print_dec_at_cursor
+    call sh_newline
+    jmp .done
+
+.do_random:
+    call sh_newline
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_GREEN
+    mov si, str_random_l
+    call print_at
+    mov dh, [sh_row]
+    mov dl, 10                  ; len of "  Random: "
+    call setcursor
+    xor ax, ax
+    int 0x1A
+    mov ax, dx
+    xor ax, cx
+    and ax, 0x3FF
+    call print_dec_at_cursor
+    call sh_newline
+    jmp .done
+
+.do_beep:
+    call sh_newline
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_YELLOW
+    mov si, str_beep_l
+    call print_at
+    call sh_newline
+    ; PC speaker: enable, set freq via 8254 ch 2, wait, disable
+    mov al, 0xB6
+    out 0x43, al
+    mov ax, 1193        ; ~1000 Hz divisor
+    out 0x42, al
+    mov al, ah
+    out 0x42, al
+    in al, 0x61
+    or al, 0x03
+    out 0x61, al
+    ; small delay loop
+    mov cx, 0x0008
+.bp_outer:
+    push cx
+    mov cx, 0xFFFF
+.bp_inner:
+    dec cx
+    jnz .bp_inner
+    pop cx
+    loop .bp_outer
+    in al, 0x61
+    and al, 0xFC
+    out 0x61, al
+    jmp .done
+
+.do_color:
+    ; Cycle through a small palette of title-bar attributes
+    mov al, [title_color]
+    cmp al, 0x4F
+    je .col_to_green
+    cmp al, 0x2F
+    je .col_to_blue
+    cmp al, 0x1F
+    je .col_to_magenta
+    cmp al, 0x5F
+    je .col_to_red
+    mov al, 0x4F
+    jmp .col_set
+.col_to_green:
+    mov al, 0x2F
+    jmp .col_set
+.col_to_blue:
+    mov al, 0x1F
+    jmp .col_set
+.col_to_magenta:
+    mov al, 0x5F
+    jmp .col_set
+.col_to_red:
+    mov al, 0x4F
+.col_set:
+    mov [title_color], al
+    call draw_titlebar
+    call sh_newline
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_GREEN
+    mov si, str_color_l
+    call print_at
+    call sh_newline
+    jmp .done
+
+.do_reboot:
+    mov ax, 0x0040
+    mov ds, ax
+    mov word [0x0072], 0x1234
+    jmp 0xFFFF:0x0000
+
+.do_shutdown:
+    mov ax, 0x5307
+    mov bx, 0x0001
+    mov cx, 0x0003
+    int 0x15
+    ; QEMU/Bochs fallback
+    mov ax, 0x2000
+    mov dx, 0x604
+    out dx, ax
+    hlt
+
+.do_tc_run:
+    call tc_run
+    jmp .done
+
+.do_manual:
+    call sh_newline
+    mov si, str_manual
+    mov bl, COL_CYAN
+    call sh_print_multiline
+    jmp .done
+
+.do_save:
+    call tc_save
+    jmp .done
+
+.do_load:
+    call tc_load
+    jmp .done
+
+.do_dir:
+    call cmd_dir
+    jmp .done
+
+.do_cat:
+    call cmd_cat
+    jmp .done
+
+.do_del:
+    call cmd_del
+    jmp .done
+
+.do_write:
+    call cmd_write
+    jmp .done
+
+.do_read:
+    call cmd_read
+    jmp .done
+
+.do_df:
+    call cmd_df
+    jmp .done
+
+.do_fsinit:
+    call cmd_fs_init
+    jmp .done
+
+.do_hist:
+    call cmd_hist
+    jmp .done
+
+.do_clock:
+    call cmd_clock
+    jmp .done
+
+.do_hex:
+    call cmd_hexdump
+    jmp .done
+
+.do_ttt:
+    call cmd_ttt
+    jmp .done
+
+.do_motd:
+    call cmd_motd
+    jmp .done
+
+.do_rename:
+    call cmd_rename
+    jmp .done
+
+.do_kedit:
+    ; Kernel binary editor
+    mov byte [ed_mode], 1
+    call kernel_editor
+    call clrscr
+    call draw_titlebar
+    call draw_statusbar
+    mov dh, 2
+    mov dl, 0
+    mov bl, COL_GREEN
+    mov si, str_shell_greet
+    call print_at
+    mov dh, 3
+    mov dl, 0
+    mov bl, COL_NORMAL
+    mov si, str_shell_hint
+    call print_at
+    mov dh, 4
+    mov dl, 0
+    mov bl, COL_CYAN
+    mov cx, 80
+    mov al, 0xC4
+    call draw_hline
+    mov byte [sh_row], 6
+    jmp .done
+
+.do_ide:
+    ; Tommy's C IDE
+    call ide_open
+    call clrscr
+    call draw_titlebar
+    call draw_statusbar
+    mov dh, 2
+    mov dl, 0
+    mov bl, COL_GREEN
+    mov si, str_shell_greet
+    call print_at
+    mov dh, 3
+    mov dl, 0
+    mov bl, COL_NORMAL
+    mov si, str_shell_hint
+    call print_at
+    mov dh, 4
+    mov dl, 0
+    mov bl, COL_CYAN
+    mov cx, 80
+    mov al, 0xC4
+    call draw_hline
+    mov byte [sh_row], 6
+    cmp byte [ed_exit_run], 1
+    jne .done
+    mov byte [ed_exit_run], 0
+    call tc_run
+
+.done:
+    call sh_newline
+    ret
+
+; ============================================================
+; PRINT CURRENT LINE from SI until 0x0A or 0 (doesn't advance SI past newline)
+; DH=row, DL=col, BL=attr  — advances SI to char after 0x0A
+; ============================================================
+print_line_si:
+    push es
+    push ax
+    push bx
+    push cx
+    push dx
+
+    mov ax, VGA_MEM
+    mov es, ax
+
+.cl:
+    mov al, [si]
+    inc si
+    cmp al, 0
+    je .cldone
+    cmp al, 0x0A
+    je .cldone
+
+    push ax              ; preserve char in AL
+    movzx cx, dh
+    imul cx, cx, SCREEN_W
+    movzx ax, dl
+    add cx, ax
+    shl cx, 1
+    mov di, cx           ; DI = VGA offset (DI is valid for addressing)
+    pop ax
+
+    mov [es:di], al
+    mov [es:di+1], bl
+    inc dl
+    jmp .cl
+.cldone:
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    pop es
+    ret
+
+; ============================================================
+; SH_NEWLINE — increment shell row with scroll
+; ============================================================
+sh_newline:
+    inc byte [sh_row]
+    movzx ax, byte [sh_row]
+    cmp ax, SCREEN_H - 2
+    jl .ok
+    call shell_scroll
+.ok:
+    ret
+
+; ============================================================
+; SHELL SCROLL — scroll content area up one line
+; ============================================================
+shell_scroll:
+    push ds
+    push es
+    push si
+    push di
+    push cx
+    push ax
+
+    ; Save VGA row 5 into the scrollback ring buffer BEFORE scrolling.
+    ; DS is still CS here (kernel segment).  We need DS=VGA for source and
+    ; ES=CS for the scrl_buf destination, then use rep movsw.
+    push bx
+    push cs
+    pop es                          ; ES = CS (scrl_buf lives here)
+    mov ax, VGA_MEM
+    mov ds, ax                      ; DS = VGA (row 5 source)
+    movzx bx, word [es:scrl_head]
+    imul bx, bx, SCREEN_W * 2
+    add bx, scrl_buf
+    mov di, bx                      ; ES:DI = destination in scrl_buf
+    mov si, 5 * SCREEN_W * 2       ; DS:SI = VGA row 5
+    mov cx, SCREEN_W
+    rep movsw
+    ; advance ring head
+    movzx bx, word [es:scrl_head]
+    inc bx
+    cmp bx, SCRL_MAX
+    jl .scrl_head_ok
+    xor bx, bx
+.scrl_head_ok:
+    mov [es:scrl_head], bx
+    ; cap scrl_n at SCRL_MAX
+    movzx bx, word [es:scrl_n]
+    cmp bx, SCRL_MAX
+    jge .scrl_n_cap
+    inc bx
+    mov [es:scrl_n], bx
+.scrl_n_cap:
+    pop bx
+    ; Now set DS=ES=VGA for the real scroll
+    mov ax, VGA_MEM
+    mov es, ax                      ; restore ES = VGA
+
+    ; Copy rows 6..23 up by 1 (preserve rows 0-5 header)
+    mov si, 6 * SCREEN_W * 2
+    mov di, 5 * SCREEN_W * 2
+    mov cx, (SCREEN_H - 7) * SCREEN_W
+    rep movsw
+
+    ; Clear the last content row
+    mov di, (SCREEN_H - 3) * SCREEN_W * 2
+    mov cx, SCREEN_W
+    mov ax, 0x0720
+    rep stosw
+
+    pop ax
+    pop cx
+    pop di
+    pop si
+    pop es
+    pop ds
+    dec byte [sh_row]
+    ret
+
+; ============================================================
+; TEXT EDITOR
+; ============================================================
+text_editor:
+    call clrscr
+
+    ; Header bar color depends on ed_mode
+    push es
+    mov ax, VGA_MEM
+    mov es, ax
+    xor di, di
+    mov cx, 80
+    mov ah, 0x1F                ; default: white on blue
+    cmp byte [ed_mode], 1
+    je .ehdr_kern
+    cmp byte [ed_mode], 2
+    je .ehdr_ide
+    jmp .ehdr_draw
+.ehdr_kern:
+    mov ah, 0x4F                ; white on red (kernel editor)
+    jmp .ehdr_draw
+.ehdr_ide:
+    mov ah, 0x2F                ; white on green (IDE)
+.ehdr_draw:
+.ehdr:
+    mov byte [es:di], ' '
+    mov byte [es:di+1], ah
+    add di, 2
+    loop .ehdr
+
+    ; Grey footer bar row 24
+    mov di, 24 * SCREEN_W * 2
+    mov cx, 80
+    mov ah, 0x70
+.eftr:
+    mov byte [es:di], ' '
+    mov byte [es:di+1], ah
+    add di, 2
+    loop .eftr
+    pop es
+
+    ; Header text
+    mov dh, 0
+    mov dl, 0
+    cmp byte [ed_mode], 1
+    je .etitle_kern
+    cmp byte [ed_mode], 2
+    je .etitle_ide
+    mov bl, 0x1F
+    mov si, str_ed_title
+    jmp .etitle_print
+.etitle_kern:
+    mov bl, 0x4F
+    mov si, str_kd_title
+    jmp .etitle_print
+.etitle_ide:
+    mov bl, 0x2F
+    mov si, str_ide_title
+.etitle_print:
+    call print_at
+
+    ; Footer text + set ed_footer_ptr
+    mov word [ed_footer_ptr], str_ed_keys
+    mov dh, 24
+    mov dl, 0
+    mov bl, 0x70
+    cmp byte [ed_mode], 2
+    jne .efkeys_normal
+    mov word [ed_footer_ptr], str_ide_keys
+    mov si, str_ide_keys
+    jmp .efkeys_print
+.efkeys_normal:
+    cmp byte [ed_mode], 1
+    jne .efkeys_std
+    mov word [ed_footer_ptr], str_kd_keys
+    mov si, str_kd_keys
+    jmp .efkeys_print
+.efkeys_std:
+    mov si, str_ed_keys
+.efkeys_print:
+    call print_at
+
+    ; Init editor state
+    mov word [ed_lines], 1
+    mov word [ed_line], 0
+    mov word [ed_col], 0
+    mov word [ed_top], 0
+
+    ; Clear buffer only in normal mode (kedit loads its own content)
+    cmp byte [ed_mode], 1
+    je .no_clr
+    mov di, ed_buf
+    mov cx, MAX_ED_LINES * ED_LINE_LEN
+    xor al, al
+    rep stosb
+.no_clr:
+
+    call ed_redraw
+
+.eloop:
+    call ed_show_cur
+    mov ah, 0x00
+    int 0x16
+
+    cmp ah, 0x01            ; ESC = quit
+    je .equit
+
+    cmp ah, 0x48            ; UP
+    je .eup
+
+    cmp ah, 0x50            ; DOWN
+    je .edown
+
+    cmp ah, 0x4B            ; LEFT
+    je .eleft
+
+    cmp ah, 0x4D            ; RIGHT
+    je .eright
+
+    cmp ah, 0x47            ; HOME
+    je .ehome
+
+    cmp ah, 0x4F            ; END
+    je .eend
+
+    cmp al, 0x0D            ; ENTER = new line
+    je .eenter
+
+    cmp al, 0x08            ; BACKSPACE
+    je .ebksp
+
+    cmp ah, 0x53            ; DEL key
+    je .edel
+
+    cmp al, 0x13            ; Ctrl-S = save
+    je .esave
+    cmp al, 0x0C            ; Ctrl-L = load
+    je .eload
+    cmp al, 0x12            ; Ctrl-R = run
+    je .erun
+    cmp al, 0x17            ; Ctrl-W = write kernel (kedit mode only)
+    je .ewrite_kern
+
+    ; Printable char
+    cmp al, 0x20
+    jl .eloop
+    call ed_put_char
+    call ed_redraw
+    jmp .eloop
+
+.esave:
+    call ed_quick_save
+    mov si, str_ed_saved
+    call ed_flash_footer
+    jmp .eloop
+
+.eload:
+    call ed_quick_load
+    call ed_redraw
+    mov si, str_ed_loaded
+    call ed_flash_footer
+    jmp .eloop
+
+.erun:
+    mov byte [ed_exit_run], 1
+    mov byte [ed_mode], 0
+    ret
+
+.ewrite_kern:
+    cmp byte [ed_mode], 1       ; only active in kernel editor mode
+    jne .eloop
+    call ed_kern_write
+    jmp .eloop
+
+.eup:
+    cmp word [ed_line], 0
+    je .eloop
+    dec word [ed_line]
+    call ed_clamp_col
+    call ed_scroll_adj
+    call ed_redraw
+    jmp .eloop
+
+.edown:
+    mov ax, [ed_lines]
+    dec ax
+    cmp [ed_line], ax
+    jge .eloop
+    inc word [ed_line]
+    call ed_clamp_col
+    call ed_scroll_adj
+    call ed_redraw
+    jmp .eloop
+
+.eleft:
+    cmp word [ed_col], 0
+    je .eloop
+    dec word [ed_col]
+    jmp .eloop
+
+.eright:
+    call ed_cur_linelen
+    cmp [ed_col], ax
+    jge .eloop
+    inc word [ed_col]
+    jmp .eloop
+
+.ehome:
+    mov word [ed_col], 0
+    jmp .eloop
+
+.eend:
+    call ed_cur_linelen
+    mov [ed_col], ax
+    jmp .eloop
+
+.eenter:
+    call ed_insert_line
+    inc word [ed_line]
+    mov word [ed_col], 0
+    call ed_scroll_adj
+    call ed_redraw
+    jmp .eloop
+
+.ebksp:
+    call ed_bksp
+    call ed_redraw
+    jmp .eloop
+
+.edel:
+    call ed_del_char
+    call ed_redraw
+    jmp .eloop
+
+.equit:
+    mov byte [ed_exit_run], 0
+    mov byte [ed_mode], 0
+    ret
+
+; ---- ed_quick_save: write ed_buf to disk slot at LBA 65 ----
+ed_quick_save:
+    pusha
+    mov ax, cs
+    mov [file_dap_seg], ax
+    mov ah, 0x43
+    mov al, 0
+    mov dl, [boot_drive]
+    mov si, file_dap
+    int 0x13
+    popa
+    ret
+
+; ---- ed_quick_load: zero ed_buf then read disk slot ----
+ed_quick_load:
+    pusha
+    mov di, ed_buf
+    mov cx, MAX_ED_LINES * ED_LINE_LEN
+    xor al, al
+    rep stosb
+    mov ax, cs
+    mov [file_dap_seg], ax
+    mov ah, 0x42
+    mov dl, [boot_drive]
+    mov si, file_dap
+    int 0x13
+    call tc_recount_lines
+    popa
+    ret
+
+; ---- ed_flash_footer: SI = zero-terminated message, paints it on
+;      row 24 with bright color, then restores the regular key hint.
+ed_flash_footer:
+    pusha
+    push si
+    ; Clear row 24 to dark
+    mov dh, 24
+    mov dl, 0
+    mov cx, 80
+    mov al, ' '
+    mov bl, 0x20            ; black on green
+    call draw_hline
+    pop si
+    mov dh, 24
+    mov dl, 2
+    mov bl, 0x2F            ; bright white on green
+    call print_at
+    ; Brief delay
+    mov cx, 0x0014
+.fl_outer:
+    push cx
+    mov cx, 0xFFFF
+.fl_inner:
+    dec cx
+    jnz .fl_inner
+    pop cx
+    loop .fl_outer
+    ; Restore regular footer (use ed_footer_ptr for mode-correct string)
+    mov dh, 24
+    mov dl, 0
+    mov cx, 80
+    mov al, ' '
+    mov bl, 0x70
+    call draw_hline
+    mov dh, 24
+    mov dl, 0
+    mov bl, 0x70
+    mov si, [ed_footer_ptr]
+    call print_at
+    popa
+    ret
+
+; ---- ed_cur_linelen: AX = length of current line ----
+ed_cur_linelen:
+    push si
+    mov si, [ed_line]
+    imul si, si, ED_LINE_LEN
+    add si, ed_buf          ; SI = start of current line
+    xor ax, ax
+.lc:
+    cmp ax, ED_LINE_LEN
+    jge .done
+    mov bx, si
+    add bx, ax              ; BX = SI + AX (valid: BX is base reg)
+    cmp byte [bx], 0
+    je .done
+    inc ax
+    jmp .lc
+.done:
+    pop si
+    ret
+
+; ---- ed_clamp_col ----
+ed_clamp_col:
+    call ed_cur_linelen
+    cmp [ed_col], ax
+    jle .ok
+    mov [ed_col], ax
+.ok:
+    ret
+
+; ---- ed_scroll_adj ----
+ed_scroll_adj:
+    mov ax, [ed_line]
+    cmp ax, [ed_top]
+    jl .scroll_up_adj
+    ; Check if below visible area
+    mov bx, [ed_top]
+    add bx, 22              ; 22 visible rows (rows 1-22)
+    cmp ax, bx
+    jl .ok_adj
+    mov bx, ax
+    sub bx, 21
+    mov [ed_top], bx
+    ret
+.scroll_up_adj:
+    mov [ed_top], ax
+.ok_adj:
+    ret
+
+; ---- ed_put_char: insert AL at cursor ----
+ed_put_char:
+    push si
+    push di
+    push ax
+    push bx
+    push cx
+
+    mov bx, [ed_line]
+    imul bx, bx, ED_LINE_LEN
+    add bx, ed_buf          ; BX = line base
+
+    mov cx, [ed_col]
+    cmp cx, ED_LINE_LEN - 1
+    jge .done
+
+    ; Shift chars right: from (linelen-1) down to col
+    push ax                 ; save char
+    call ed_cur_linelen     ; AX = linelen
+    cmp ax, ED_LINE_LEN - 1
+    jge .pop_done           ; line full
+
+    ; SI = BX + linelen - 1 (last char)
+    mov si, bx
+    add si, ax              ; SI = end of text
+    ; DI = SI + 1 (destination: one right)
+    mov di, si
+    inc di
+
+    ; shift from si down to bx+col
+    mov ax, [ed_col]
+    mov cx, [ed_line]       ; reuse cx temporarily
+    call ed_cur_linelen     ; AX = linelen again
+    mov cx, ax
+    sub cx, [ed_col]        ; cx = chars to shift
+    jz .no_shift
+
+.shift_right:
+    mov al, [si]
+    mov [di], al
+    dec si
+    dec di
+    loop .shift_right
+
+.no_shift:
+    pop ax                  ; restore char to insert
+    ; Write char at BX + col
+    mov si, bx
+    add si, [ed_col]
+    mov [si], al
+    inc word [ed_col]
+    jmp .done
+
+.pop_done:
+    pop ax
+.done:
+    pop cx
+    pop bx
+    pop ax
+    pop di
+    pop si
+    ret
+
+; ---- ed_bksp: delete char before cursor ----
+ed_bksp:
+    cmp word [ed_col], 0
+    je .at_bol
+    dec word [ed_col]
+    call ed_del_char
+    ret
+.at_bol:
+    ; merge with previous line (simplified: just move cursor up)
+    cmp word [ed_line], 0
+    je .done
+    dec word [ed_line]
+    call ed_cur_linelen
+    mov [ed_col], ax
+.done:
+    ret
+
+; ---- ed_del_char: delete char at cursor ----
+ed_del_char:
+    push si
+    push di
+    push cx
+
+    mov si, [ed_line]
+    imul si, si, ED_LINE_LEN
+    add si, ed_buf
+
+    mov di, si
+    add di, [ed_col]        ; DI = cursor pos in line
+    mov si, di
+    inc si                  ; SI = char after cursor
+
+    ; Shift left
+    mov cx, ED_LINE_LEN
+    sub cx, [ed_col]
+    dec cx
+    jz .clear_last
+.del_shift:
+    mov al, [si]
+    mov [di], al
+    inc si
+    inc di
+    loop .del_shift
+
+.clear_last:
+    ; Zero the last position
+    mov di, [ed_line]
+    imul di, di, ED_LINE_LEN
+    add di, ed_buf
+    add di, ED_LINE_LEN - 1
+    mov byte [di], 0
+
+    pop cx
+    pop di
+    pop si
+    ret
+
+; ---- ed_insert_line: insert blank line after current ----
+ed_insert_line:
+    mov ax, [ed_lines]
+    cmp ax, MAX_ED_LINES - 1
+    jge .done
+
+    ; Shift lines down from (lines-1) to (ed_line+1)
+    ; Use SI=source, DI=dest for rep movsb
+    mov ax, [ed_lines]      ; ax = count
+    dec ax                  ; ax = last index
+
+.shift:
+    cmp ax, [ed_line]
+    jle .clear_new
+
+    ; DI = line[ax+1], SI = line[ax]
+    push ax
+    inc ax
+    imul ax, ax, ED_LINE_LEN
+    add ax, ed_buf
+    mov di, ax
+    pop ax
+
+    push ax
+    imul ax, ax, ED_LINE_LEN
+    add ax, ed_buf
+    mov si, ax
+    pop ax
+
+    push ax
+    push cx
+    mov cx, ED_LINE_LEN
+    rep movsb
+    pop cx
+    pop ax
+    dec ax
+    jmp .shift
+
+.clear_new:
+    ; Zero out ed_line+1
+    mov ax, [ed_line]
+    inc ax
+    imul ax, ax, ED_LINE_LEN
+    add ax, ed_buf
+    mov di, ax
+    mov cx, ED_LINE_LEN
+    xor al, al
+    rep stosb
+    inc word [ed_lines]
+
+.done:
+    ret
+
+; ---- ed_redraw: redraw entire editor content area ----
+ed_redraw:
+    push es
+    mov ax, VGA_MEM
+    mov es, ax
+
+    ; Clear content area rows 1-23
+    mov di, SCREEN_W * 2
+    mov cx, SCREEN_W * 22
+.er_clr:
+    mov word [es:di], 0x0720
+    add di, 2
+    loop .er_clr
+
+    ; Render visible lines
+    mov ax, [ed_top]
+    mov byte [ed_tmp_row], 1
+
+.er_row:
+    movzx bx, byte [ed_tmp_row]
+    cmp bx, 23
+    jge .er_done
+    cmp ax, [ed_lines]
+    jge .er_done
+
+    ; Set row base in VGA
+    imul bx, bx, SCREEN_W * 2   ; bx = VGA row offset
+    add bx, 8                    ; +4 chars gutter
+
+    ; Get line pointer
+    push ax
+    imul ax, ax, ED_LINE_LEN
+    add ax, ed_buf
+    mov si, ax
+    pop ax
+
+    ; Print up to ED_LINE_LEN chars
+    push ax
+    mov cx, ED_LINE_LEN
+.er_char:
+    cmp cx, 0
+    je .er_next
+    cmp byte [si], 0
+    je .er_next
+    mov al, [si]
+    mov byte [es:bx], al
+    mov byte [es:bx+1], 0x07
+    inc si
+    add bx, 2
+    dec cx
+    jmp .er_char
+
+.er_next:
+    pop ax
+    inc ax
+    inc byte [ed_tmp_row]
+    jmp .er_row
+
+.er_done:
+    pop es
+
+    ; Highlight current line
+    call ed_hl_curline
+    ret
+
+; ---- ed_hl_curline: highlight current line ----
+ed_hl_curline:
+    push es
+    mov ax, VGA_MEM
+    mov es, ax
+
+    mov ax, [ed_line]
+    sub ax, [ed_top]
+    inc ax                  ; +1 for header row
+    imul ax, ax, SCREEN_W * 2
+    add ax, 8               ; gutter
+    mov di, ax
+
+    mov cx, SCREEN_W - 4
+.hl:
+    mov byte [es:di+1], 0x02  ; dark green attr
+    add di, 2
+    loop .hl
+    pop es
+    ret
+
+; ---- ed_show_cur: position hardware cursor ----
+ed_show_cur:
+    mov ax, [ed_line]
+    sub ax, [ed_top]
+    inc ax
+    mov dh, al
+    mov ax, [ed_col]
+    add ax, 4
+    mov dl, al
+    call setcursor
+    ret
+
+; ============================================================
+; KERNEL EDITOR - load kernel binary from disk into editor
+; ============================================================
+kernel_editor:
+    ; Clear ed_buf
+    mov di, ed_buf
+    mov cx, MAX_ED_LINES * ED_LINE_LEN
+    xor al, al
+    rep stosb
+
+    ; Read 22 kernel sectors (LBA 1..22) into ed_buf
+    mov ax, cs
+    mov [kedit_dap_seg], ax
+    mov ah, 0x42            ; INT 13h extended read
+    mov dl, [boot_drive]
+    mov si, kedit_dap
+    int 0x13
+    jc .ke_err
+
+    ; Replace null bytes with '.' so editor lines don't terminate early
+    mov si, ed_buf
+    mov cx, 22 * 512        ; bytes actually loaded
+.ke_null:
+    cmp byte [si], 0
+    jne .ke_notnull
+    mov byte [si], '.'
+.ke_notnull:
+    inc si
+    dec cx
+    jnz .ke_null
+
+    ; Count lines: 22*512/ED_LINE_LEN = 144 lines, +1 partial
+    mov word [ed_lines], 145
+
+    ; Open editor in kernel mode (ed_mode=1 already set by caller)
+    mov word [ed_line], 0
+    mov word [ed_col], 0
+    mov word [ed_top], 0
+    call text_editor
+    ret
+
+.ke_err:
+    call sh_newline
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_RED
+    mov si, str_kern_load_err
+    call print_at
+    call sh_newline
+    ret
+
+; ---- ed_kern_write: write ed_buf back to kernel sectors (Ctrl-W) ----
+ed_kern_write:
+    pusha
+    ; Warn on footer row
+    mov dh, 24
+    mov dl, 0
+    mov cx, 80
+    mov al, ' '
+    mov bl, 0x4F
+    call draw_hline
+    mov dh, 24
+    mov dl, 0
+    mov bl, 0x4F
+    mov si, str_kern_warn
+    call print_at
+    ; Wait for Y/N
+    mov ah, 0x00
+    int 0x16
+    cmp al, 'Y'
+    je .kw_do
+    cmp al, 'y'
+    je .kw_do
+    ; Cancelled — restore footer
+    mov dh, 24
+    mov dl, 0
+    mov cx, 80
+    mov al, ' '
+    mov bl, 0x70
+    call draw_hline
+    mov dh, 24
+    mov dl, 0
+    mov bl, 0x70
+    mov si, [ed_footer_ptr]
+    call print_at
+    popa
+    ret
+.kw_do:
+    mov ax, cs
+    mov [kedit_dap_seg], ax
+    mov ah, 0x43            ; INT 13h extended write
+    mov al, 0
+    mov dl, [boot_drive]
+    mov si, kedit_dap
+    int 0x13
+    jc .kw_err
+    mov si, str_kern_saved
+    call ed_flash_footer
+    popa
+    ret
+.kw_err:
+    mov si, str_kern_save_err
+    call ed_flash_footer
+    popa
+    ret
+
+; ============================================================
+; TOMMY'S C IDE - open editor in IDE mode (ed_mode=2)
+; ============================================================
+ide_open:
+    ; Buffer keeps existing content (user edits their TC program)
+    mov byte [ed_mode], 2
+    call text_editor
+    ret
+
+; ============================================================
+; GRAPHICS MODE - menu with 4 mini-apps
+;   1 PAINT    2 BALL    3 PALETTE    4 CLOCK    ESC exit
+; ============================================================
+graphics_mode:
+    ; Init mouse once
+    cmp byte [ms_ready], 0
+    jne .ms_ok
+    call mouse_init
+.ms_ok:
+.gm_main:
+    mov ax, 0x0013
+    int 0x10
+    mov byte [ms_saved], 0
+    call gfx_draw_menu
+
+.gm_wait:
+    ; Poll mouse + keys until something interesting
+    call mouse_poll
+    call mouse_restore_bg
+    call mouse_draw_cursor
+
+    ; Check for key
+    mov ah, 0x01
+    int 0x16
+    jz .no_key
+    mov ah, 0x00
+    int 0x16
+    cmp ah, 0x01
+    je .gm_exit
+    cmp al, '1'
+    je .gm_paint
+    cmp al, '2'
+    je .gm_ball
+    cmp al, '3'
+    je .gm_pal
+    cmp al, '4'
+    je .gm_clock
+    cmp al, '5'
+    je .gm_snake
+    cmp al, '6'
+    je .gm_stars
+    jmp .no_key
+.no_key:
+    ; Check mouse click (left button transition 0->1)
+    mov al, [ms_btn]
+    and al, 1
+    mov bl, [ms_lbtn_prev]
+    mov [ms_lbtn_prev], al
+    cmp al, 0
+    je .gm_wait
+    cmp bl, 0
+    jne .gm_wait
+
+    ; Click! Hit-test menu rows. Items at y=64..151 (8 rows each, gap of 4)
+    mov ax, [ms_y]
+    cmp ax, 64
+    jl .gm_wait
+    sub ax, 64
+    mov bl, 12
+    xor dx, dx
+    div bl                       ; AL = (y-64)/12  -> 0..5
+    cmp al, 0
+    je .gm_paint
+    cmp al, 1
+    je .gm_ball
+    cmp al, 2
+    je .gm_pal
+    cmp al, 3
+    je .gm_clock
+    cmp al, 4
+    je .gm_snake
+    cmp al, 5
+    je .gm_stars
+    jmp .gm_wait
+
+.gm_paint:
+    call gfx_app_paint
+    jmp .gm_main
+.gm_ball:
+    call gfx_app_ball
+    jmp .gm_main
+.gm_pal:
+    call gfx_app_palette
+    jmp .gm_main
+.gm_clock:
+    call gfx_app_clock
+    jmp .gm_main
+.gm_snake:
+    call gfx_app_snake
+    jmp .gm_main
+.gm_stars:
+    call gfx_app_starfield
+    jmp .gm_main
+
+.gm_exit:
+    mov ax, 0x0003
+    int 0x10
+    ret
+
+; --- gfx_draw_menu: paint the static menu chrome ---
+gfx_draw_menu:
+    ; Gradient background
+    call gfx_draw_bg
+
+    ; Title bar (rows 0..15 dark blue)
+    push es
+    mov ax, 0xA000
+    mov es, ax
+    xor di, di
+    mov cx, 16 * 320 / 2
+    mov ax, 0x0101
+    rep stosw
+    ; Bottom bar (rows 184..199)
+    mov di, 184 * 320
+    mov cx, 16 * 320 / 2
+    mov ax, 0x0808
+    rep stosw
+    pop es
+
+    mov bp, gfx_title
+    mov cx, 23
+    mov dh, 0
+    mov dl, 8
+    mov bl, 0x0F
+    call gfx_print
+
+    mov bp, gfx_subtitle
+    mov cx, 24
+    mov dh, 3
+    mov dl, 8
+    mov bl, 0x0E
+    call gfx_print
+
+    ; Menu items
+    mov bp, gfx_menu1
+    mov cx, 28
+    mov dh, 8
+    mov dl, 5
+    mov bl, 0x0A
+    call gfx_print
+
+    mov bp, gfx_menu2
+    mov cx, 27
+    mov dh, 10
+    mov dl, 5
+    mov bl, 0x0E
+    call gfx_print
+
+    mov bp, gfx_menu3
+    mov cx, 24
+    mov dh, 12
+    mov dl, 5
+    mov bl, 0x0B
+    call gfx_print
+
+    mov bp, gfx_menu4
+    mov cx, 28
+    mov dh, 14
+    mov dl, 5
+    mov bl, 0x0D
+    call gfx_print
+
+    mov bp, gfx_menu5
+    mov cx, 27
+    mov dh, 16
+    mov dl, 5
+    mov bl, 0x0C
+    call gfx_print
+
+    mov bp, gfx_menu6
+    mov cx, 28
+    mov dh, 18
+    mov dl, 5
+    mov bl, 0x09
+    call gfx_print
+
+    mov bp, gfx_esc
+    mov cx, 27
+    mov dh, 24
+    mov dl, 6
+    mov bl, 0x0F
+    call gfx_print
+    ret
+
+; ---- gfx_fill: AL = color, fills 320x200 in mode 13h ----
+gfx_fill:
+    push es
+    push ax
+    push cx
+    push di
+    mov ah, al
+    push ax
+    mov ax, 0xA000
+    mov es, ax
+    pop ax
+    xor di, di
+    mov cx, 320*200/2
+    rep stosw
+    pop di
+    pop cx
+    pop ax
+    pop es
+    ret
+
+; ---- gfx_print: BP=str, CX=len, DH=row, DL=col, BL=color ----
+gfx_print:
+    push ax
+    push bx
+    push bp
+    mov ah, 0x13
+    mov al, 0x01
+    mov bh, 0
+    int 0x10
+    pop bp
+    pop bx
+    pop ax
+    ret
+
+; ---- gfx_putpixel: CX=x, DX=y, AL=color. Preserves all. ----
+gfx_putpixel:
+    push es
+    push di
+    push bx
+    push ax
+    mov bx, 0xA000
+    mov es, bx
+    mov bx, dx
+    imul bx, bx, 320
+    add bx, cx
+    mov di, bx
+    pop ax
+    mov [es:di], al
+    pop bx
+    pop di
+    pop es
+    ret
+
+; ---- gfx_fillrect5: CX=x, DX=y, AL=color. 5x5 block. ----
+gfx_fillrect5:
+    push si
+    push di
+    push cx
+    push dx
+    push ax
+    mov si, 5
+.fr_row:
+    push cx
+    mov di, 5
+.fr_col:
+    call gfx_putpixel
+    inc cx
+    dec di
+    jnz .fr_col
+    pop cx
+    inc dx
+    dec si
+    jnz .fr_row
+    pop ax
+    pop dx
+    pop cx
+    pop di
+    pop si
+    ret
+
+; ============================================================
+; APP: PAINT - move cursor with arrows, leaves a colored trail
+; ============================================================
+; Mouse paint:
+;   move mouse to position
+;   LEFT click/drag = paint with current color
+;   RIGHT click     = cycle color
+;   c               = clear canvas
+;   ESC             = back to menu
+;   arrows          = also move (fallback if no mouse)
+gfx_app_paint:
+    cmp byte [ms_ready], 0
+    jne .ms_ok
+    call mouse_init
+.ms_ok:
+    xor al, al
+    call gfx_fill
+    mov bp, gfx_paint_hint
+    mov cx, 30
+    mov dh, 0
+    mov dl, 5
+    mov bl, 0x0F
+    call gfx_print
+    mov byte [gfx_col], 0x0A
+    mov byte [ms_saved], 0
+.pl:
+    call mouse_poll
+    call mouse_restore_bg
+
+    ; If left button held, stamp at cursor (under the cursor sprite area)
+    mov al, [ms_btn]
+    test al, 0x01
+    jz .no_paint
+    mov cx, [ms_x]
+    mov dx, [ms_y]
+    cmp dx, 12
+    jl .no_paint
+    cmp dx, 195
+    jg .no_paint
+    mov al, [gfx_col]
+    call gfx_fillrect5
+.no_paint:
+    ; Right button (transition) = cycle color
+    mov al, [ms_btn]
+    and al, 0x02
+    mov bl, [ms_rbtn_prev]
+    mov [ms_rbtn_prev], al
+    cmp al, 0
+    je .skip_cycle
+    cmp bl, 0
+    jne .skip_cycle
+    call .do_cycle
+.skip_cycle:
+
+    call mouse_draw_cursor
+
+    ; Non-blocking key check
+    mov ah, 0x01
+    int 0x16
+    jz .pl
+    mov ah, 0x00
+    int 0x16
+    cmp ah, 0x01
+    je .pp_done
+    cmp al, 'c'
+    je .pp_clear
+    cmp al, 'C'
+    je .pp_clear
+    cmp al, ' '
+    je .pp_kcolor
+    jmp .pl
+
+.do_cycle:
+    inc byte [gfx_col]
+    cmp byte [gfx_col], 0
+    jne .dc_ret
+    mov byte [gfx_col], 1
+.dc_ret:
+    ret
+
+.pp_kcolor:
+    call .do_cycle
+    jmp .pl
+
+.pp_clear:
+    xor al, al
+    call gfx_fill
+    mov bp, gfx_paint_hint
+    mov cx, 30
+    mov dh, 0
+    mov dl, 5
+    mov bl, 0x0F
+    call gfx_print
+    mov byte [ms_saved], 0
+    jmp .pl
+.pp_done:
+    ret
+
+; ============================================================
+; APP: BOUNCING BALL
+; ============================================================
+gfx_app_ball:
+    xor al, al
+    call gfx_fill
+    mov bp, gfx_ball_hint
+    mov cx, 16
+    mov dh, 0
+    mov dl, 12
+    mov bl, 0x0F
+    call gfx_print
+    mov word [gfx_x], 50
+    mov word [gfx_y], 60
+    mov word [gfx_dx], 2
+    mov word [gfx_dy], 1
+.bl:
+    mov ah, 0x01
+    int 0x16
+    jz .b_skip_key
+    mov ah, 0x00
+    int 0x16
+    cmp ah, 0x01
+    je .b_done
+.b_skip_key:
+    ; Erase old ball
+    mov cx, [gfx_x]
+    mov dx, [gfx_y]
+    xor al, al
+    call gfx_fillrect5
+
+    ; Update x
+    mov ax, [gfx_x]
+    add ax, [gfx_dx]
+    cmp ax, 4
+    jg .b_no_lx
+    neg word [gfx_dx]
+    mov ax, 4
+.b_no_lx:
+    cmp ax, 310
+    jl .b_no_rx
+    neg word [gfx_dx]
+    mov ax, 310
+.b_no_rx:
+    mov [gfx_x], ax
+
+    ; Update y
+    mov ax, [gfx_y]
+    add ax, [gfx_dy]
+    cmp ax, 12
+    jg .b_no_uy
+    neg word [gfx_dy]
+    mov ax, 12
+.b_no_uy:
+    cmp ax, 192
+    jl .b_no_dy
+    neg word [gfx_dy]
+    mov ax, 192
+.b_no_dy:
+    mov [gfx_y], ax
+
+    ; Draw new ball
+    mov cx, [gfx_x]
+    mov dx, [gfx_y]
+    mov al, 0x0E
+    call gfx_fillrect5
+
+    ; Delay
+    mov cx, 0x0003
+.b_outer:
+    push cx
+    mov cx, 0xFFFF
+.b_inner:
+    dec cx
+    jnz .b_inner
+    pop cx
+    loop .b_outer
+    jmp .bl
+.b_done:
+    ret
+
+; ============================================================
+; APP: PALETTE - all 256 VGA colors in a 16x16 grid
+; ============================================================
+gfx_app_palette:
+    xor al, al
+    call gfx_fill
+    mov bp, gfx_pal_hint
+    mov cx, 16
+    mov dh, 0
+    mov dl, 12
+    mov bl, 0x0F
+    call gfx_print
+
+    push es
+    mov ax, 0xA000
+    mov es, ax
+    mov di, 20 * 320          ; y=20
+
+    xor bx, bx                ; cell row 0..15
+.prow:
+    cmp bx, 16
+    jge .pdone
+    mov si, 10                ; 10 pixel rows per cell row
+.pyloop:
+    xor dx, dx                ; cell col 0..15
+.pcol:
+    cmp dx, 16
+    jge .pcol_done
+    mov ax, bx
+    shl ax, 4
+    add ax, dx                ; AL = color = bx*16 + dx
+    mov cx, 20
+    rep stosb
+    inc dx
+    jmp .pcol
+.pcol_done:
+    dec si
+    jnz .pyloop
+    inc bx
+    jmp .prow
+.pdone:
+    pop es
+
+.pwait:
+    mov ah, 0x00
+    int 0x16
+    cmp ah, 0x01
+    jne .pwait
+    ret
+
+; ============================================================
+; APP: CLOCK - live BIOS time, redraw each second
+; ============================================================
+gfx_app_clock:
+    xor al, al
+    call gfx_fill
+    mov bp, gfx_clk_hint
+    mov cx, 16
+    mov dh, 22
+    mov dl, 12
+    mov bl, 0x0F
+    call gfx_print
+.ck_loop:
+    ; Clear the time region (rows 80..120)
+    push es
+    mov ax, 0xA000
+    mov es, ax
+    mov di, 80 * 320
+    mov cx, 40 * 320 / 2
+    xor ax, ax
+    rep stosw
+    pop es
+
+    call gfx_make_time_str
+
+    mov bp, clk_buf
+    mov cx, 8
+    mov dh, 12
+    mov dl, 16
+    mov bl, 0x0F
+    call gfx_print
+
+    ; Wait roughly 1 second, polling ESC
+    mov bx, 16
+.ck_wait:
+    mov ah, 0x01
+    int 0x16
+    jz .ck_no_key
+    mov ah, 0x00
+    int 0x16
+    cmp ah, 0x01
+    je .ck_done
+.ck_no_key:
+    mov cx, 0x0001
+.cd_outer:
+    push cx
+    mov cx, 0xFFFF
+.cd_inner:
+    dec cx
+    jnz .cd_inner
+    pop cx
+    loop .cd_outer
+    dec bx
+    jnz .ck_wait
+    jmp .ck_loop
+.ck_done:
+    ret
+
+; ---- gfx_make_time_str: build HH:MM:SS into clk_buf ----
+gfx_make_time_str:
+    push ax
+    push cx
+    push dx
+    mov ah, 0x02
+    int 0x1A
+    ; HH (CH BCD)
+    mov al, ch
+    mov ah, al
+    shr ah, 4
+    and ah, 0x0F
+    add ah, '0'
+    mov [clk_buf+0], ah
+    and al, 0x0F
+    add al, '0'
+    mov [clk_buf+1], al
+    mov byte [clk_buf+2], ':'
+    ; MM (CL BCD)
+    mov al, cl
+    mov ah, al
+    shr ah, 4
+    and ah, 0x0F
+    add ah, '0'
+    mov [clk_buf+3], ah
+    and al, 0x0F
+    add al, '0'
+    mov [clk_buf+4], al
+    mov byte [clk_buf+5], ':'
+    ; SS (DH BCD)
+    mov al, dh
+    mov ah, al
+    shr ah, 4
+    and ah, 0x0F
+    add ah, '0'
+    mov [clk_buf+6], ah
+    and al, 0x0F
+    add al, '0'
+    mov [clk_buf+7], al
+    pop dx
+    pop cx
+    pop ax
+    ret
+
+; ============================================================
+; TITLE BAR
+; ============================================================
+draw_titlebar:
+    push es
+    mov ax, VGA_MEM
+    mov es, ax
+    xor di, di
+    mov cx, 80
+    mov ah, [title_color]
+.l:
+    mov byte [es:di], ' '
+    mov byte [es:di+1], ah
+    add di, 2
+    loop .l
+    pop es
+
+    mov dh, 0
+    mov dl, 2
+    mov bl, [title_color]
+    mov si, str_title
+    call print_at
+
+    mov dh, 0
+    mov dl, 60
+    mov bl, [title_color]
+    mov si, str_title_r
+    call print_at
+    ret
+
+; ============================================================
+; STATUS BAR
+; ============================================================
+draw_statusbar:
+    push es
+    mov ax, VGA_MEM
+    mov es, ax
+    mov di, (SCREEN_H-1) * SCREEN_W * 2
+    mov cx, 80
+    mov ah, COL_STATUS
+.l:
+    mov byte [es:di], ' '
+    mov byte [es:di+1], ah
+    add di, 2
+    loop .l
+    pop es
+
+    mov dh, 24
+    mov dl, 2
+    mov bl, COL_STATUS
+    mov si, str_status
+    call print_at
+    ret
+
+; ============================================================
+; CLEAR SCREEN
+; ============================================================
+clrscr:
+    push es
+    mov ax, VGA_MEM
+    mov es, ax
+    xor di, di
+    mov cx, SCREEN_W * SCREEN_H
+    mov ax, 0x0720
+    rep stosw
+    pop es
+    mov ah, 0x02
+    xor bh, bh
+    xor dx, dx
+    int 0x10
+    ret
+
+; ============================================================
+; PRINT_AT: SI=string, DH=row, DL=col, BL=colour attr
+; ============================================================
+print_at:
+    push es
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+
+    mov ax, VGA_MEM
+    mov es, ax
+
+.pa_loop:
+    lodsb
+    or al, al
+    jz .pa_done
+    cmp al, 0x0A
+    je .pa_nl
+
+    ; Compute VGA offset into DI (preserve AL = character via stack)
+    push ax
+    movzx cx, dh
+    imul cx, cx, SCREEN_W
+    movzx ax, dl
+    add cx, ax
+    shl cx, 1
+    mov di, cx
+    pop ax
+
+    mov [es:di], al
+    mov [es:di+1], bl
+    inc dl
+    cmp dl, SCREEN_W
+    jl .pa_loop
+    mov dl, 0
+    inc dh
+    jmp .pa_loop
+
+.pa_nl:
+    mov dl, 0
+    inc dh
+    jmp .pa_loop
+
+.pa_done:
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    pop es
+    ret
+
+; ============================================================
+; DRAW_HLINE: DH=row, DL=col, CX=count, AL=char, BL=attr
+; ============================================================
+draw_hline:
+    push es
+    push ax
+    push bx
+    push cx
+    push di
+
+    mov bh, al
+    mov ax, VGA_MEM
+    mov es, ax
+
+    movzx ax, dh
+    imul ax, ax, SCREEN_W
+    movzx di, dl
+    add ax, di
+    shl ax, 1
+    mov di, ax
+
+.dh_loop:
+    mov byte [es:di], bh
+    mov byte [es:di+1], bl
+    add di, 2
+    loop .dh_loop
+
+    pop di
+    pop cx
+    pop bx
+    pop ax
+    pop es
+    ret
+
+; ============================================================
+; SETCURSOR: DH=row, DL=col
+; ============================================================
+setcursor:
+    push ax
+    push bx
+    mov ah, 0x02
+    xor bh, bh
+    int 0x10
+    pop bx
+    pop ax
+    ret
+
+; ============================================================
+; READLINE_ECHO: DI=buf, CX=maxlen
+; ============================================================
+readline_echo:
+    push ax
+    push bx
+    push cx
+    push di
+    xor bx, bx
+.re_loop:
+    mov ah, 0x00
+    int 0x16
+    ; Check scroll-mode keys first (work regardless of hist_enabled)
+    cmp ah, 0x49         ; PageUp  = scroll back
+    je .re_pgup
+    cmp ah, 0x51         ; PageDown = scroll forward / exit
+    je .re_pgdn
+    ; If currently in scroll view, any other key exits it
+    cmp byte [scrl_mode], 0
+    je .re_no_scrl_exit
+    call scrl_exit_view
+.re_no_scrl_exit:
+    cmp al, 0x0D
+    je .re_done
+    cmp al, 0x08
+    je .re_bksp
+    test al, al
+    jz .re_ext           ; extended key (arrows, F-keys, ...)
+    cmp al, 0x09         ; Tab = try completion
+    je .re_tab
+    cmp bx, cx
+    jge .re_loop
+    mov [di+bx], al
+    inc bx
+    mov ah, 0x0E
+    xor bh, bh
+    int 0x10
+    jmp .re_loop
+.re_pgup:
+    ; Scroll back in terminal history
+    cmp word [scrl_n], 0
+    je .re_loop             ; no history yet
+    cmp byte [scrl_mode], 0
+    jne .re_pgup_more       ; already in scroll mode — go further back
+    call scrl_enter_view
+    jmp .re_loop
+.re_pgup_more:
+    ; Check if we can scroll further back
+    mov ax, [scrl_off]
+    inc ax
+    ; scrl_off max = scrl_n - 1 (can't go back more than what we have)
+    mov bx, [scrl_n]
+    dec bx
+    cmp ax, bx
+    jg .re_loop             ; already at oldest line
+    mov [scrl_off], ax
+    call scrl_show_view
+    jmp .re_loop
+.re_pgdn:
+    cmp byte [scrl_mode], 0
+    je .re_loop             ; not in scroll mode
+    cmp word [scrl_off], 0
+    je .re_pgdn_exit        ; already at newest — exit scroll mode
+    dec word [scrl_off]
+    call scrl_show_view
+    jmp .re_loop
+.re_pgdn_exit:
+    call scrl_exit_view
+    jmp .re_loop
+.re_ext:
+    cmp byte [hist_enabled], 0
+    je .re_loop
+    cmp ah, 0x48         ; UP
+    je .re_up
+    cmp ah, 0x50         ; DOWN
+    je .re_down
+    jmp .re_loop
+.re_up:
+    mov al, [hist_view]
+    cmp al, [hist_count]
+    jae .re_loop
+    inc al
+    mov [hist_view], al
+    call hist_apply
+    jmp .re_loop
+.re_down:
+    cmp byte [hist_view], 0
+    je .re_loop
+    dec byte [hist_view]
+    call hist_apply
+    jmp .re_loop
+.re_tab:
+    ; Tab completion: scan tab_list for prefix match
+    cmp bx, 0
+    je .re_loop
+    cmp byte [hist_enabled], 0
+    je .re_loop
+    ; scan tab_list for entries matching [di..di+bx-1] as prefix
+    mov word [tab_count], 0
+    mov word [tab_match_ptr], 0
+    mov si, tab_list
+.rtl:
+    cmp byte [si], 0
+    je .rtd
+    ; compare [si..] with [di..di+bx-1]
+    push si
+    push di
+    push bx
+.rtc:
+    cmp bx, 0
+    je .rtm
+    mov al, [si]
+    or al, al
+    je .rtn
+    cmp al, [di]
+    jne .rtn
+    inc si
+    inc di
+    dec bx
+    jmp .rtc
+.rtm:
+    pop bx
+    pop di
+    pop si
+    inc word [tab_count]
+    mov [tab_match_ptr], si
+.rtskip:
+    mov al, [si]
+    or al, al
+    je .rtne
+    inc si
+    jmp .rtskip
+.rtne:
+    inc si
+    jmp .rtl
+.rtn:
+    pop bx
+    pop di
+    pop si
+.rtskip2:
+    mov al, [si]
+    or al, al
+    je .rtne2
+    inc si
+    jmp .rtskip2
+.rtne2:
+    inc si
+    jmp .rtl
+.rtd:
+    cmp word [tab_count], 1
+    jne .re_loop
+    ; exactly one match: print suffix and store it
+    mov si, [tab_match_ptr]
+    add si, bx                 ; skip past already-typed prefix
+.rtfill:
+    mov al, [si]
+    or al, al
+    je .rtspace
+    cmp bx, cx
+    jge .rtspace
+    mov [di+bx], al
+    inc bx
+    push ax
+    mov ah, 0x0E
+    xor bh, bh
+    int 0x10
+    pop ax
+    inc si
+    jmp .rtfill
+.rtspace:
+    cmp bx, cx
+    jge .re_loop
+    mov byte [di+bx], ' '
+    inc bx
+    push ax
+    mov ah, 0x0E
+    mov al, ' '
+    xor bh, bh
+    int 0x10
+    pop ax
+    jmp .re_loop
+
+.re_bksp:
+    cmp bx, 0
+    je .re_loop
+    dec bx
+    mov ah, 0x0E
+    mov al, 0x08
+    int 0x10
+    mov al, ' '
+    int 0x10
+    mov al, 0x08
+    int 0x10
+    jmp .re_loop
+.re_done:
+    pop di
+    mov byte [di+bx], 0
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; ============================================================
+; TERMINAL SCROLLBACK - scrl_enter_view / scrl_exit_view / scrl_show_view
+; ============================================================
+
+; scrl_enter_view: save rows 5-22 to scrl_save, show scrollback, enter scroll mode
+scrl_enter_view:
+    push ds
+    push es
+    push si
+    push di
+    push cx
+    ; Copy VGA rows 5..22 (18 rows × 160 bytes) into scrl_save in CS
+    ; DS=VGA (source), ES=CS (dest)
+    push cs
+    pop es                          ; ES = kernel segment
+    mov ax, VGA_MEM
+    mov ds, ax                      ; DS = VGA
+    mov si, 5 * SCREEN_W * 2
+    mov di, scrl_save
+    mov cx, 18 * SCREEN_W
+    rep movsw
+    ; restore DS
+    push cs
+    pop ds
+    pop cx
+    pop di
+    pop si
+    pop es
+    pop ds
+    mov byte [scrl_mode], 1
+    mov word [scrl_off], 0
+    call scrl_show_view
+    ret
+
+; scrl_exit_view: restore rows 5-22 from scrl_save, exit scroll mode
+scrl_exit_view:
+    cmp byte [scrl_mode], 0
+    je .done
+    push ds
+    push es
+    push si
+    push di
+    push cx
+    ; Copy scrl_save back into VGA rows 5..22
+    ; DS=CS (scrl_save source), ES=VGA (dest) — normal movsw direction
+    mov ax, VGA_MEM
+    mov es, ax
+    mov si, scrl_save
+    mov di, 5 * SCREEN_W * 2
+    mov cx, 18 * SCREEN_W
+    rep movsw
+    pop cx
+    pop di
+    pop si
+    pop es
+    pop ds
+    mov byte [scrl_mode], 0
+    mov word [scrl_off], 0
+.done:
+    ret
+
+; scrl_show_view: render scrollback ring buffer into VGA rows 5..21,
+;                 show hint on row 22.  Called with DS=CS, must set ES=VGA.
+scrl_show_view:
+    push ds
+    push es
+    push si
+    push di
+    push ax
+    push bx
+    push cx
+
+    mov ax, VGA_MEM
+    mov es, ax                      ; ES = VGA (destination)
+    ; DS is already CS (scrl_buf source)
+
+    ; Clear rows 5..21 with scroll-mode colour (bright white on blue)
+    mov di, 5 * SCREEN_W * 2
+    mov cx, 17 * SCREEN_W
+    mov ax, 0x1F20
+    rep stosw
+
+    ; Print scroll hint on row 22
+    mov dh, 22
+    mov dl, 0
+    mov bl, 0x70
+    mov si, str_scrl_hint
+    call print_at
+
+    ; Display up to 17 lines from the scrollback ring.
+    ; Row 5+i shows the line (scrl_off + 16 - i) back from newest.
+    xor cx, cx                      ; cx = row index i (0..16)
+.sv_loop:
+    cmp cx, 17
+    jge .sv_done
+
+    ; k = scrl_off + 16 - cx  (lines back from newest)
+    mov ax, [scrl_off]
+    mov bx, 16
+    sub bx, cx
+    add ax, bx                      ; ax = k
+
+    ; Skip if we don't have this line yet
+    cmp ax, [scrl_n]
+    jge .sv_blank
+
+    ; ring_idx = (scrl_head - 1 - k + SCRL_MAX) % SCRL_MAX
+    mov bx, [scrl_head]
+    dec bx
+    sub bx, ax                      ; bx = scrl_head - 1 - k
+    test bx, 0x8000                 ; negative?
+    jz .sv_pos
+    add bx, SCRL_MAX                ; add once (enough for SCRL_MAX=10)
+.sv_pos:
+    cmp bx, SCRL_MAX
+    jl .sv_got_idx
+    sub bx, SCRL_MAX
+.sv_got_idx:
+    ; SI = scrl_buf + ring_idx * SCREEN_W * 2  (in DS = CS)
+    imul bx, bx, SCREEN_W * 2
+    add bx, scrl_buf
+    mov si, bx
+
+    ; DI = VGA row (5 + cx)
+    mov di, cx
+    add di, 5
+    imul di, di, SCREEN_W * 2
+
+    push cx
+    mov cx, SCREEN_W
+    rep movsw                       ; DS:SI (scrl_buf) -> ES:DI (VGA)
+    pop cx
+    jmp .sv_next
+
+.sv_blank:
+    ; Dim row — no data for this position
+    mov di, cx
+    add di, 5
+    imul di, di, SCREEN_W * 2
+    push cx
+    mov cx, SCREEN_W
+    mov ax, 0x0820
+    rep stosw
+    pop cx
+
+.sv_next:
+    inc cx
+    jmp .sv_loop
+
+.sv_done:
+    pop cx
+    pop bx
+    pop ax
+    pop di
+    pop si
+    pop es
+    pop ds
+    ret
+
+; ============================================================
+; SHELL HISTORY
+;   hist_apply: replace current input with hist_buf entry at
+;     view position hist_view (1 = newest, 0 = empty/current).
+;     On entry: DI = buf base, BX = current length.
+;     On exit:  buffer/display reflect the new content, BX updated.
+;   hist_push: copy DI's null-terminated string into the next
+;     ring slot. Skips empty strings.
+; ============================================================
+MAX_HIST equ 8
+
+hist_apply:
+    push ax
+    push cx
+    push si
+.hap_erase:
+    cmp bx, 0
+    je .hap_eraseD
+    mov ah, 0x0E
+    mov al, 0x08
+    xor bh, bh
+    int 0x10
+    mov al, ' '
+    int 0x10
+    mov al, 0x08
+    int 0x10
+    dec bx
+    jmp .hap_erase
+.hap_eraseD:
+    push di
+    push cx
+    mov cx, MAX_CMD
+    xor al, al
+    rep stosb
+    pop cx
+    pop di
+
+    cmp byte [hist_view], 0
+    je .hap_done
+
+    movzx ax, byte [hist_head]
+    movzx cx, byte [hist_view]
+    sub ax, cx
+    add ax, MAX_HIST
+    and ax, MAX_HIST - 1
+    imul ax, ax, MAX_CMD
+    add ax, hist_buf
+    mov si, ax
+
+.hap_copy:
+    mov al, [si]
+    or al, al
+    jz .hap_done
+    cmp bx, MAX_CMD - 1
+    jge .hap_done
+    mov [di+bx], al
+    inc bx
+    push si
+    mov ah, 0x0E
+    xor bh, bh
+    int 0x10
+    pop si
+    inc si
+    jmp .hap_copy
+.hap_done:
+    pop si
+    pop cx
+    pop ax
+    ret
+
+hist_push:
+    push ax
+    push bx
+    push cx
+    push si
+    push di
+    cmp byte [di], 0
+    je .hp_done
+    movzx ax, byte [hist_head]
+    imul ax, ax, MAX_CMD
+    add ax, hist_buf
+    mov bx, ax
+    mov si, di
+    mov di, bx
+    mov cx, MAX_CMD
+.hp_cp:
+    mov al, [si]
+    mov [di], al
+    or al, al
+    jz .hp_pad
+    inc si
+    inc di
+    dec cx
+    jnz .hp_cp
+    jmp .hp_advance
+.hp_pad:
+    inc di
+    dec cx
+.hp_pz:
+    cmp cx, 0
+    je .hp_advance
+    mov byte [di], 0
+    inc di
+    dec cx
+    jmp .hp_pz
+.hp_advance:
+    movzx ax, byte [hist_head]
+    inc ax
+    and al, MAX_HIST - 1
+    mov [hist_head], al
+    movzx ax, byte [hist_count]
+    cmp ax, MAX_HIST
+    jge .hp_done
+    inc ax
+    mov [hist_count], al
+.hp_done:
+    pop di
+    pop si
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; ============================================================
+; READLINE_NOECHO: DI=buf, CX=maxlen
+; ============================================================
+readline_noecho:
+    push ax
+    push bx
+    push cx
+    push di
+    xor bx, bx
+.rn_loop:
+    mov ah, 0x00
+    int 0x16
+    cmp al, 0x0D
+    je .rn_done
+    cmp al, 0x08
+    je .rn_bksp
+    cmp bx, cx
+    jge .rn_loop
+    mov [di+bx], al
+    inc bx
+    jmp .rn_loop
+.rn_bksp:
+    cmp bx, 0
+    je .rn_loop
+    dec bx
+    jmp .rn_loop
+.rn_done:
+    pop di
+    mov byte [di+bx], 0
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; ============================================================
+; STRCMP: SI=a, DI=b — AL=1 if equal
+; ============================================================
+strcmp:
+    push si
+    push di
+.sc_l:
+    mov al, [si]
+    mov ah, [di]
+    cmp al, ah
+    jne .sc_ne
+    or al, al
+    jz .sc_eq
+    inc si
+    inc di
+    jmp .sc_l
+.sc_eq:
+    mov al, 1
+    jmp .sc_ret
+.sc_ne:
+    xor al, al
+.sc_ret:
+    pop di
+    pop si
+    ret
+
+; ============================================================
+; CMD_MATCH: compare cmd_buf(SI) prefix with DI, sets ZF
+; ============================================================
+cmd_match:
+    push si
+    push di
+    push ax
+.cm_loop:
+    mov al, [di]
+    or al, al
+    jz .cm_end
+    mov ah, [si]
+    cmp al, ah
+    jne .cm_no
+    inc si
+    inc di
+    jmp .cm_loop
+.cm_end:
+    ; DI string ended — SI must be space or end
+    mov al, [si]
+    or al, al
+    jz .cm_yes
+    cmp al, ' '
+    je .cm_yes
+    cmp al, 0x0D
+    je .cm_yes
+.cm_no:
+    pop ax
+    pop di
+    pop si
+    or ax, 1
+    cmp ax, 0           ; clear ZF
+    ret
+.cm_yes:
+    pop ax
+    pop di
+    pop si
+    xor ax, ax
+    cmp ax, 0           ; set ZF
+    ret
+
+; ============================================================
+; SKIP_SPACES: advance SI past spaces
+; ============================================================
+skip_spaces:
+    cmp byte [si], ' '
+    jne .done
+    inc si
+    jmp skip_spaces
+.done:
+    ret
+
+; ============================================================
+; SH_PRINT_MULTILINE: print a multi-line 0-terminated string,
+; one shell line at a time (handles 0x0A as line breaks).
+; SI = string, BL = color attr
+; ============================================================
+sh_print_multiline:
+    cmp byte [si], 0
+    je .pm_done
+    mov dh, [sh_row]
+    mov dl, 2
+    call print_line_si       ; advances SI past 0x0A or to 0
+    call sh_newline
+    jmp sh_print_multiline
+.pm_done:
+    ret
+
+; ============================================================
+; PUTC_AT_CURSOR: print AL via BIOS teletype at current cursor
+; ============================================================
+putc_at_cursor:
+    push ax
+    push bx
+    mov ah, 0x0E
+    xor bh, bh
+    mov bl, 0x07
+    int 0x10
+    pop bx
+    pop ax
+    ret
+
+; ============================================================
+; PRINT_BCD_AT_CURSOR: print AL as two BCD digits at cursor
+; ============================================================
+print_bcd_at_cursor:
+    push ax
+    mov ah, al
+    shr ah, 4
+    and ah, 0x0F
+    add ah, '0'
+    push ax
+    mov al, ah
+    call putc_at_cursor
+    pop ax
+    pop ax
+    push ax
+    and al, 0x0F
+    add al, '0'
+    call putc_at_cursor
+    pop ax
+    ret
+
+; ============================================================
+; PRINT_DEC_AT_CURSOR: print AX as decimal (unsigned)
+; ============================================================
+print_dec_at_cursor:
+    push ax
+    push bx
+    push cx
+    push dx
+    mov cx, 0            ; digit count
+    mov bx, 10
+    cmp ax, 0
+    jne .pd_loop
+    mov al, '0'
+    call putc_at_cursor
+    jmp .pd_done2
+.pd_loop:
+    cmp ax, 0
+    je .pd_emit
+    xor dx, dx
+    div bx               ; AX/10 → AX, remainder DX
+    push dx
+    inc cx
+    jmp .pd_loop
+.pd_emit:
+    cmp cx, 0
+    je .pd_done2
+    pop ax
+    add al, '0'
+    call putc_at_cursor
+    dec cx
+    jmp .pd_emit
+.pd_done2:
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; ============================================================
+; WAIT_ENTER
+; ============================================================
+wait_enter:
+    mov ah, 0x00
+    int 0x16
+    cmp al, 0x0D
+    jne wait_enter
+    ret
+
+; ============================================================
+; CMD_SYSINFO - report memory, equipment, video mode
+; ============================================================
+cmd_sysinfo:
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_CYAN
+    mov si, str_si_hdr
+    call print_at
+    call sh_newline
+
+    ; --- Conventional RAM (int 12h, returns AX = KB) ---
+    mov dh, [sh_row]
+    mov dl, 2
+    mov bl, COL_NORMAL
+    mov si, str_si_ram
+    call print_at
+    mov dh, [sh_row]
+    mov dl, 22
+    call setcursor
+    int 0x12
+    call print_dec_at_cursor
+    mov si, str_si_kb
+    call print_str_at_cursor
+    call sh_newline
+
+    ; --- Equipment list (int 11h) ---
+    mov dh, [sh_row]
+    mov dl, 2
+    mov bl, COL_NORMAL
+    mov si, str_si_eq
+    call print_at
+    mov dh, [sh_row]
+    mov dl, 22
+    call setcursor
+    int 0x11
+    call print_hex_word_at_cursor
+    call sh_newline
+
+    ; --- Boot drive ---
+    mov dh, [sh_row]
+    mov dl, 2
+    mov bl, COL_NORMAL
+    mov si, str_si_drv
+    call print_at
+    mov dh, [sh_row]
+    mov dl, 22
+    call setcursor
+    mov al, [boot_drive]
+    call print_hex_byte_at_cursor
+    call sh_newline
+
+    ; --- Video mode (int 10h, AH=0Fh) ---
+    mov dh, [sh_row]
+    mov dl, 2
+    mov bl, COL_NORMAL
+    mov si, str_si_vid
+    call print_at
+    mov dh, [sh_row]
+    mov dl, 22
+    call setcursor
+    mov ah, 0x0F
+    int 0x10
+    call print_hex_byte_at_cursor
+    call sh_newline
+    call sh_newline
+    ret
+
+; ============================================================
+; CMD_CPUID - show vendor string + family/model
+; ============================================================
+cmd_cpuid:
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_CYAN
+    mov si, str_cp_hdr
+    call print_at
+    call sh_newline
+
+    ; CPUID leaf 0 -> vendor in EBX,EDX,ECX
+    mov eax, 0
+    cpuid
+    mov [cpu_vendor+0],  ebx
+    mov [cpu_vendor+4],  edx
+    mov [cpu_vendor+8],  ecx
+    mov byte [cpu_vendor+12], 0
+
+    mov dh, [sh_row]
+    mov dl, 2
+    mov bl, COL_GREEN
+    mov si, str_cp_vendor
+    call print_at
+    mov dh, [sh_row]
+    mov dl, 12
+    mov bl, COL_BRIGHT
+    mov si, cpu_vendor
+    call print_at
+    call sh_newline
+
+    ; CPUID leaf 1 -> family/model/stepping in EAX
+    mov eax, 1
+    cpuid
+    mov [cpu_sig], eax
+
+    mov dh, [sh_row]
+    mov dl, 2
+    mov bl, COL_GREEN
+    mov si, str_cp_sig
+    call print_at
+    mov dh, [sh_row]
+    mov dl, 12
+    call setcursor
+    mov ax, [cpu_sig]
+    call print_hex_word_at_cursor
+    call sh_newline
+    call sh_newline
+    ret
+
+; ============================================================
+; CMD_CALC - parse "calc N op N" from cmd_buf
+; ============================================================
+cmd_calc:
+    mov si, cmd_buf
+    call skip_spaces
+    add si, 4                       ; skip "calc"
+    call skip_spaces
+
+    call parse_dec
+    mov [calc_a], ax
+    call skip_spaces
+
+    mov al, [si]
+    mov [calc_op], al
+    inc si
+    call skip_spaces
+
+    call parse_dec
+    mov [calc_b], ax
+
+    mov ax, [calc_a]
+    mov bx, [calc_b]
+    mov cl, [calc_op]
+
+    cmp cl, '+'
+    je .add
+    cmp cl, '-'
+    je .sub
+    cmp cl, '*'
+    je .mul
+    cmp cl, '/'
+    je .div
+    cmp cl, 'x'
+    je .mul
+
+    ; Unknown operator
+    mov dh, [sh_row]
+    mov dl, 2
+    mov bl, COL_RED
+    mov si, str_calc_badop
+    call print_at
+    call sh_newline
+    call sh_newline
+    ret
+
+.add:
+    add ax, bx
+    jmp .show
+.sub:
+    sub ax, bx
+    jmp .show
+.mul:
+    mul bx                          ; DX:AX = AX*BX, ignore overflow
+    jmp .show
+.div:
+    cmp bx, 0
+    je .divzero
+    xor dx, dx
+    div bx                          ; AX = AX/BX
+    jmp .show
+
+.divzero:
+    mov dh, [sh_row]
+    mov dl, 2
+    mov bl, COL_RED
+    mov si, str_calc_div0
+    call print_at
+    call sh_newline
+    call sh_newline
+    ret
+
+.show:
+    push ax
+    mov dh, [sh_row]
+    mov dl, 2
+    mov bl, COL_BRIGHT
+    mov si, str_calc_eq
+    call print_at
+    mov dh, [sh_row]
+    mov dl, 6
+    call setcursor
+    pop ax
+    call print_dec_at_cursor
+    call sh_newline
+    call sh_newline
+    ret
+
+; parse_dec: SI = string ptr, returns AX = number, advances SI
+parse_dec:
+    push bx
+    push cx
+    xor ax, ax
+    mov bx, 10
+.pd:
+    mov cl, [si]
+    cmp cl, '0'
+    jb .done
+    cmp cl, '9'
+    ja .done
+    mul bx
+    sub cl, '0'
+    xor ch, ch
+    add ax, cx
+    inc si
+    jmp .pd
+.done:
+    pop cx
+    pop bx
+    ret
+
+; print_str_at_cursor: SI = 0-terminated, prints via BIOS teletype
+print_str_at_cursor:
+    push ax
+    push bx
+.ps:
+    mov al, [si]
+    or al, al
+    jz .pd
+    inc si
+    mov ah, 0x0E
+    xor bh, bh
+    mov bl, 0x07
+    int 0x10
+    jmp .ps
+.pd:
+    pop bx
+    pop ax
+    ret
+
+; print_hex_byte_at_cursor: AL = byte
+print_hex_byte_at_cursor:
+    push ax
+    push ax
+    shr al, 4
+    call .nib
+    pop ax
+    and al, 0x0F
+    call .nib
+    pop ax
+    ret
+.nib:
+    and al, 0x0F
+    cmp al, 10
+    jb .dig
+    add al, 'A' - 10
+    jmp .out
+.dig:
+    add al, '0'
+.out:
+    call putc_at_cursor
+    ret
+
+; print_hex_word_at_cursor: AX = word
+print_hex_word_at_cursor:
+    push ax
+    mov al, ah
+    call print_hex_byte_at_cursor
+    pop ax
+    call print_hex_byte_at_cursor
+    ret
+
+; ============================================================
+; HASH_PASSWORD - FNV-1a 32-bit with key stretching + salt
+;   In : hp_pw_ptr -> null-terminated password
+;        hp_un_ptr -> null-terminated salt (username)
+;   Out: hp_result = 32-bit hash (dword)
+; ============================================================
+hash_password:
+    pushad
+    mov eax, 0x811C9DC5         ; FNV-1a offset basis
+    mov bp, 4096                ; rounds of key stretching
+.hp_round:
+    mov si, [hp_pw_ptr]
+.hp_pw:
+    mov bl, [si]
+    or bl, bl
+    jz .hp_un_start
+    xor al, bl
+    mov ecx, 0x01000193         ; FNV prime
+    mul ecx                     ; EDX:EAX = EAX * ECX, keep low 32 in EAX
+    inc si
+    jmp .hp_pw
+.hp_un_start:
+    mov si, [hp_un_ptr]
+.hp_un:
+    mov bl, [si]
+    or bl, bl
+    jz .hp_round_done
+    xor al, bl
+    mov ecx, 0x01000193
+    mul ecx
+    inc si
+    jmp .hp_un
+.hp_round_done:
+    dec bp
+    jnz .hp_round
+    mov [hp_result], eax
+    popad
+    ret
+
+; ============================================================
+; DISK_INIT - set DAP buffer segment to CS (once at boot)
+; ============================================================
+disk_init:
+    push ax
+    mov ax, cs
+    mov [dap_buf_seg], ax
+    pop ax
+    ret
+
+; ============================================================
+; DISK_READ_CONFIG - read LBA 64 -> cfg_disk_buf via INT 13h AH=42h
+;   Out: cfg_disk_ok = 1 on success, 0 on failure
+; ============================================================
+disk_read_config:
+    push ax
+    push dx
+    push si
+    mov byte [cfg_disk_ok], 0
+    mov ah, 0x42
+    mov dl, [boot_drive]
+    mov si, dap
+    int 0x13
+    jc .drc_done
+    mov byte [cfg_disk_ok], 1
+.drc_done:
+    pop si
+    pop dx
+    pop ax
+    ret
+
+; ============================================================
+; DISK_WRITE_CONFIG - write cfg_disk_buf -> LBA 64 via AH=43h
+; ============================================================
+disk_write_config:
+    push ax
+    push dx
+    push si
+    mov byte [cfg_disk_ok], 0
+    mov ah, 0x43
+    mov al, 0                   ; write w/o verify
+    mov dl, [boot_drive]
+    mov si, dap
+    int 0x13
+    jc .dwc_done
+    mov byte [cfg_disk_ok], 1
+.dwc_done:
+    pop si
+    pop dx
+    pop ax
+    ret
+
+; ============================================================
+; LOAD_CONFIG_FROM_DISK - read sector, populate cfg_magic, cfg_username, cfg_pwhash
+; ============================================================
+load_config_from_disk:
+    pusha
+    call disk_read_config
+    cmp byte [cfg_disk_ok], 1
+    jne .lcfd_done
+
+    ; Layout in cfg_disk_buf: magic(1) | username(33) | pwhash(4)
+    mov al, [cfg_disk_buf]
+    mov [cfg_magic], al
+
+    mov si, cfg_disk_buf + 1
+    mov di, cfg_username
+    mov cx, 33
+    rep movsb
+
+    mov eax, [cfg_disk_buf + 34]
+    mov [cfg_pwhash], eax
+.lcfd_done:
+    popa
+    ret
+
+; ============================================================
+; SAVE_CONFIG_TO_DISK - serialize cfg_* and write sector
+; ============================================================
+save_config_to_disk:
+    pusha
+
+    ; Zero the buffer first
+    mov di, cfg_disk_buf
+    xor al, al
+    mov cx, 512
+    rep stosb
+
+    ; magic(1) | username(33) | pwhash(4)
+    mov al, [cfg_magic]
+    mov [cfg_disk_buf], al
+
+    mov si, cfg_username
+    mov di, cfg_disk_buf + 1
+    mov cx, 33
+    rep movsb
+
+    mov eax, [cfg_pwhash]
+    mov [cfg_disk_buf + 34], eax
+
+    call disk_write_config
+    popa
+    ret
+
+; ============================================================
+; PS/2 MOUSE DRIVER (polled, real-mode)
+; ============================================================
+ps2_wait_in:
+    push cx
+    push ax
+    mov cx, 0xFFFF
+.w:
+    in al, 0x64
+    test al, 0x02
+    jz .d
+    loop .w
+.d:
+    pop ax
+    pop cx
+    ret
+
+ps2_wait_out:
+    push cx
+    push ax
+    mov cx, 0xFFFF
+.w:
+    in al, 0x64
+    test al, 0x01
+    jnz .d
+    loop .w
+.d:
+    pop ax
+    pop cx
+    ret
+
+mouse_send:
+    call ps2_wait_in
+    mov al, 0xD4
+    out 0x64, al
+    call ps2_wait_in
+    ret
+
+mouse_ack:
+    push cx
+    mov cx, 0xFFFF
+.w:
+    in al, 0x64
+    test al, 0x01
+    jnz .r
+    loop .w
+    pop cx
+    ret
+.r:
+    in al, 0x60
+    pop cx
+    ret
+
+mouse_init:
+    pusha
+    ; Enable aux device
+    call ps2_wait_in
+    mov al, 0xA8
+    out 0x64, al
+    ; Read controller config
+    call ps2_wait_in
+    mov al, 0x20
+    out 0x64, al
+    call ps2_wait_out
+    in al, 0x60
+    and al, 0xDD         ; clear bit 1 (no mouse IRQ -- we poll) & bit 5 (enable mouse clock)
+    mov bl, al
+    ; Write config back
+    call ps2_wait_in
+    mov al, 0x60
+    out 0x64, al
+    call ps2_wait_in
+    mov al, bl
+    out 0x60, al
+    ; Set defaults
+    call mouse_send
+    mov al, 0xF6
+    out 0x60, al
+    call mouse_ack
+    ; Enable data reporting
+    call mouse_send
+    mov al, 0xF4
+    out 0x60, al
+    call mouse_ack
+
+    mov byte [ms_pkt_idx], 0
+    mov word [ms_x], 160
+    mov word [ms_y], 100
+    mov byte [ms_btn], 0
+    mov byte [ms_saved], 0
+    mov byte [ms_ready], 1
+    popa
+    ret
+
+; mouse_poll - drain any pending PS/2 data; non-blocking
+mouse_poll:
+    push ax
+    push bx
+.l:
+    in al, 0x64
+    test al, 0x01
+    jz .done
+    test al, 0x20
+    jz .kbd
+    in al, 0x60
+    movzx bx, byte [ms_pkt_idx]
+    mov [ms_pkt+bx], al
+    inc bx
+    cmp bx, 3
+    jl .save
+    call mouse_process
+    xor bx, bx
+.save:
+    mov [ms_pkt_idx], bl
+    jmp .l
+.kbd:
+    ; Don't consume keyboard data here; leave it for int 16h
+    jmp .done
+.done:
+    pop bx
+    pop ax
+    ret
+
+mouse_process:
+    push ax
+    push bx
+    push dx
+    mov al, [ms_pkt]
+    test al, 0x08
+    jz .bad             ; invalid packet header
+    mov [ms_btn], al
+
+    ; --- X ---
+    test al, 0x40       ; X overflow -> ignore
+    jnz .skip_x
+    mov bl, [ms_pkt+1]
+    mov bh, 0
+    test bl, bl
+    jns .x_pos
+    mov bh, 0xFF
+.x_pos:
+    mov dx, [ms_x]
+    add dx, bx
+    cmp dx, 0
+    jge .x_chi
+    xor dx, dx
+.x_chi:
+    cmp dx, 319
+    jle .x_ok
+    mov dx, 319
+.x_ok:
+    mov [ms_x], dx
+.skip_x:
+
+    ; --- Y (mouse +y means up, screen +y means down -> negate) ---
+    test al, 0x80
+    jnz .skip_y
+    mov bl, [ms_pkt+2]
+    mov bh, 0
+    test bl, bl
+    jns .y_pos
+    mov bh, 0xFF
+.y_pos:
+    neg bx
+    mov dx, [ms_y]
+    add dx, bx
+    cmp dx, 0
+    jge .y_chi
+    xor dx, dx
+.y_chi:
+    cmp dx, 199
+    jle .y_ok
+    mov dx, 199
+.y_ok:
+    mov [ms_y], dx
+.skip_y:
+
+.bad:
+    pop dx
+    pop bx
+    pop ax
+    ret
+
+; --- mouse_save_bg: save 8x8 region at ms_x,ms_y -> ms_bg ---
+mouse_save_bg:
+    pusha
+    push es
+    push ds
+
+    ; Record save position while DS still points at the kernel.
+    ; (Earlier this was done after DS was swapped to 0xA000, which
+    ; meant ms_saved/ms_saved_x/ms_saved_y were being written into
+    ; VRAM and never updated — so the cursor never got erased and
+    ; left a trail at every position it visited.)
+    mov ax, [ms_y]
+    mov [ms_saved_y], ax
+    mov bx, [ms_x]
+    mov [ms_saved_x], bx
+    mov byte [ms_saved], 1
+
+    push ax                  ; save Y
+    push bx                  ; save X
+
+    push cs
+    pop es                   ; ES = kernel (dest)
+    mov di, ms_bg
+    mov ax, 0xA000
+    mov ds, ax               ; DS = VRAM (source)
+
+    pop bx                   ; X
+    pop ax                   ; Y
+    imul ax, ax, 320
+    add ax, bx
+    mov si, ax
+
+    mov cx, 8
+.row:
+    push cx
+    push si
+    mov cx, 8
+.col:
+    mov al, [si]
+    mov [es:di], al
+    inc si
+    inc di
+    loop .col
+    pop si
+    pop cx
+    add si, 320
+    loop .row
+
+    pop ds
+    pop es
+    popa
+    ret
+
+; --- mouse_restore_bg: restore previously-saved 8x8 region ---
+mouse_restore_bg:
+    pusha
+    push es
+    push ds
+    cmp byte [ms_saved], 0
+    je .skip
+
+    push cs
+    pop ds
+    mov ax, 0xA000
+    mov es, ax
+    mov si, ms_bg
+
+    mov ax, [ms_saved_y]
+    mov bx, [ms_saved_x]
+    imul ax, ax, 320
+    add ax, bx
+    mov di, ax
+
+    mov cx, 8
+.row:
+    push cx
+    push di
+    mov cx, 8
+.col:
+    mov al, [si]
+    mov [es:di], al
+    inc si
+    inc di
+    loop .col
+    pop di
+    pop cx
+    add di, 320
+    loop .row
+
+    mov byte [ms_saved], 0
+.skip:
+    pop ds
+    pop es
+    popa
+    ret
+
+; --- mouse_draw_cursor: save bg then stamp arrow sprite ---
+mouse_draw_cursor:
+    call mouse_save_bg
+    pusha
+    push es
+    push ds
+
+    push cs
+    pop ds
+    mov ax, 0xA000
+    mov es, ax
+    mov si, ms_sprite
+
+    mov ax, [ms_y]
+    mov bx, [ms_x]
+    imul ax, ax, 320
+    add ax, bx
+    mov di, ax
+
+    mov cx, 8
+.row:
+    push cx
+    push di
+    mov cx, 8
+.col:
+    mov al, [si]
+    or al, al
+    jz .sk          ; 0 = transparent
+    cmp al, 1
+    jne .wh
+    mov byte [es:di], 0x00   ; black border
+    jmp .sk
+.wh:
+    mov byte [es:di], 0x0F   ; white fill
+.sk:
+    inc si
+    inc di
+    loop .col
+    pop di
+    pop cx
+    add di, 320
+    loop .row
+
+    pop ds
+    pop es
+    popa
+    ret
+
+; ============================================================
+; GFX_DRAW_BG - simple shaded background (blue gradient)
+; ============================================================
+gfx_draw_bg:
+    push es
+    push di
+    push ax
+    push bx
+    push cx
+    mov ax, 0xA000
+    mov es, ax
+    xor di, di
+    mov bx, 200          ; row counter
+.r:
+    ; pick color based on row index
+    mov al, 0            ; row counter from top
+    mov cx, 200
+    sub cx, bx
+    ; color = 17 + (cx / 25)  -> roughly 17..24
+    mov ax, cx
+    shr ax, 5
+    add al, 17
+    mov ah, al
+    mov cx, 320/2
+    rep stosw
+    dec bx
+    jnz .r
+    pop cx
+    pop bx
+    pop ax
+    pop di
+    pop es
+    ret
+
+; gfx_hline_bar: draw a filled horizontal bar
+; AX=row, BL=color, fills 320 pixels wide
+gfx_hline_bar:
+    push es
+    push di
+    push ax
+    push cx
+    mov cx, ax
+    mov ax, 0xA000
+    mov es, ax
+    mov ax, cx
+    imul ax, ax, 320
+    mov di, ax
+    mov al, bl
+    mov ah, bl
+    mov cx, 320/2
+    rep stosw
+    pop cx
+    pop ax
+    pop di
+    pop es
+    ret
+
+; gfx_box: draw an outlined box
+; AX=x, BX=y, CX=w, DX=h, BP=color (lo byte)
+gfx_box:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+
+    push ax
+    push bx
+    push cx
+    push dx
+    ; top edge
+    mov si, cx           ; width
+.te:
+    mov cx, ax
+    mov dx, bx
+    push ax
+    mov ax, bp
+    call gfx_putpixel
+    pop ax
+    inc ax
+    dec si
+    jnz .te
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+
+    push ax
+    push bx
+    push cx
+    push dx
+    ; bottom edge
+    mov si, cx
+    add bx, dx
+    dec bx
+.be:
+    mov cx, ax
+    mov dx, bx
+    push ax
+    mov ax, bp
+    call gfx_putpixel
+    pop ax
+    inc ax
+    dec si
+    jnz .be
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+
+    push ax
+    push bx
+    push cx
+    push dx
+    ; left edge
+    mov si, dx
+.le:
+    mov cx, ax
+    mov dx, bx
+    push ax
+    mov ax, bp
+    call gfx_putpixel
+    pop ax
+    inc bx
+    dec si
+    jnz .le
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+
+    push ax
+    push bx
+    push cx
+    push dx
+    ; right edge
+    mov si, dx
+    add ax, cx
+    dec ax
+.re:
+    mov cx, ax
+    mov dx, bx
+    push ax
+    mov ax, bp
+    call gfx_putpixel
+    pop ax
+    inc bx
+    dec si
+    jnz .re
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; ============================================================
+; SNAKE GAME (graphics mode)
+;  - 32x18 grid of 8x8 cells, centered at (32,16)
+;  - Arrows steer, ESC quits, food = red, snake = green, head = bright
+; ============================================================
+SNAKE_CELL    equ 8
+SNAKE_COLS    equ 32
+SNAKE_ROWS    equ 18
+SNAKE_OX      equ 32
+SNAKE_OY      equ 20
+SNAKE_MAX     equ 256
+
+gfx_app_snake_entry:
+    mov ax, 0x0013
+    int 0x10
+    call gfx_app_snake
+    mov ax, 0x0003
+    int 0x10
+    ret
+
+gfx_app_snake:
+    xor al, al
+    call gfx_fill
+
+    mov bp, snk_title
+    mov cx, 16
+    mov dh, 0
+    mov dl, 12
+    mov bl, 0x0E
+    call gfx_print
+
+    mov bp, snk_hint
+    mov cx, 28
+    mov dh, 24
+    mov dl, 6
+    mov bl, 0x0F
+    call gfx_print
+
+    ; Border around play area
+    mov ax, SNAKE_OX-1
+    mov bx, SNAKE_OY-1
+    mov cx, SNAKE_COLS*SNAKE_CELL+2
+    mov dx, SNAKE_ROWS*SNAKE_CELL+2
+    mov bp, 0x0F
+    call gfx_box
+
+    ; Initialize snake state
+    mov word [snk_len], 4
+    mov word [snk_head], 3
+    mov word [snk_dir], 1                   ; right
+    mov word [snk_score], 0
+
+    ; place starting body  cells (0..3) horizontally at row 9
+    mov byte [snk_body+0*2+0], 8
+    mov byte [snk_body+0*2+1], 9
+    mov byte [snk_body+1*2+0], 9
+    mov byte [snk_body+1*2+1], 9
+    mov byte [snk_body+2*2+0], 10
+    mov byte [snk_body+2*2+1], 9
+    mov byte [snk_body+3*2+0], 11
+    mov byte [snk_body+3*2+1], 9
+
+    call snk_place_food
+
+    ; Initial draw
+    call snk_redraw_all
+
+.sloop:
+    ; Read key non-blocking
+    mov ah, 0x01
+    int 0x16
+    jz .no_key
+    mov ah, 0x00
+    int 0x16
+    cmp ah, 0x01
+    je .quit
+    cmp ah, 0x48
+    jne .nu
+    cmp word [snk_dir], 2
+    je .no_key
+    mov word [snk_dir], 0
+    jmp .no_key
+.nu:
+    cmp ah, 0x4D
+    jne .nr
+    cmp word [snk_dir], 3
+    je .no_key
+    mov word [snk_dir], 1
+    jmp .no_key
+.nr:
+    cmp ah, 0x50
+    jne .nd
+    cmp word [snk_dir], 0
+    je .no_key
+    mov word [snk_dir], 2
+    jmp .no_key
+.nd:
+    cmp ah, 0x4B
+    jne .no_key
+    cmp word [snk_dir], 1
+    je .no_key
+    mov word [snk_dir], 3
+.no_key:
+
+    call snk_step
+    cmp al, 0
+    je .quit
+
+    ; delay ~ frame
+    mov cx, 0x0008
+.do:
+    push cx
+    mov cx, 0xFFFF
+.di:
+    dec cx
+    jnz .di
+    pop cx
+    loop .do
+    jmp .sloop
+
+.quit:
+    ; Game over banner
+    mov bp, snk_over
+    mov cx, 9
+    mov dh, 12
+    mov dl, 16
+    mov bl, 0x0C
+    call gfx_print
+
+    mov bp, snk_press
+    mov cx, 18
+    mov dh, 14
+    mov dl, 12
+    mov bl, 0x0F
+    call gfx_print
+
+    mov ah, 0
+    int 0x16
+    ret
+
+; snk_step: advance one tick. AL=0 means game over.
+snk_step:
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+
+    ; Compute new head from old head + dir
+    mov bx, [snk_head]
+    shl bx, 1
+    mov al, [snk_body+bx+0]         ; head X
+    mov ah, [snk_body+bx+1]         ; head Y
+
+    mov dx, [snk_dir]
+    cmp dx, 0
+    jne .nu
+    dec ah
+    jmp .gotnh
+.nu:
+    cmp dx, 1
+    jne .nd
+    inc al
+    jmp .gotnh
+.nd:
+    cmp dx, 2
+    jne .nl
+    inc ah
+    jmp .gotnh
+.nl:
+    dec al
+.gotnh:
+    ; collision with wall?
+    cmp al, 0
+    jl .die
+    cmp al, SNAKE_COLS-1
+    jg .die
+    cmp ah, 0
+    jl .die
+    cmp ah, SNAKE_ROWS-1
+    jg .die
+
+    mov [snk_nx], al
+    mov [snk_ny], ah
+
+    ; collision with self? scan body
+    mov si, snk_body
+    mov dx, [snk_len]
+    sub dx, 1                       ; check all except tail (tail will move)
+.ck:
+    cmp dx, 0
+    jle .nocoll
+    mov bl, [si]
+    cmp bl, [snk_nx]
+    jne .ckn
+    mov bl, [si+1]
+    cmp bl, [snk_ny]
+    jne .ckn
+    jmp .die
+.ckn:
+    add si, 2
+    dec dx
+    jmp .ck
+.nocoll:
+
+    ; Did we hit food?
+    mov al, [snk_nx]
+    mov ah, [snk_ny]
+    cmp al, [snk_fx]
+    jne .nofood
+    cmp ah, [snk_fy]
+    jne .nofood
+
+    ; Grow: shift body right by 2 bytes (push new head at front conceptually).
+    ; Easier: store body as array [0..len-1] where last is head.
+    ; To grow: append new head; do not move tail.
+    mov cx, [snk_len]
+    cmp cx, SNAKE_MAX-1
+    jge .nogrow
+    mov bx, cx
+    shl bx, 1
+    mov al, [snk_nx]
+    mov [snk_body+bx], al
+    mov al, [snk_ny]
+    mov [snk_body+bx+1], al
+    inc word [snk_len]
+    mov [snk_head], cx
+    inc word [snk_score]
+    call snk_place_food
+    call snk_redraw_all
+    jmp .ok
+.nogrow:
+    call snk_redraw_all
+    jmp .ok
+
+.nofood:
+    ; Move: shift everything left by one slot
+    mov cx, [snk_len]
+    dec cx
+    mov si, snk_body+2
+    mov di, snk_body
+.mv:
+    cmp cx, 0
+    je .mvd
+    mov al, [si]
+    mov [di], al
+    mov al, [si+1]
+    mov [di+1], al
+    add si, 2
+    add di, 2
+    dec cx
+    jmp .mv
+.mvd:
+    mov cx, [snk_len]
+    dec cx
+    mov bx, cx
+    shl bx, 1
+    mov al, [snk_nx]
+    mov [snk_body+bx], al
+    mov al, [snk_ny]
+    mov [snk_body+bx+1], al
+    mov [snk_head], cx
+    call snk_redraw_all
+
+.ok:
+    mov al, 1
+    jmp .done
+.die:
+    xor al, al
+.done:
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    ret
+
+snk_redraw_all:
+    pusha
+    push es
+
+    mov ax, 0xA000
+    mov es, ax
+
+    ; Clear play area
+    mov cx, SNAKE_ROWS
+    mov bx, SNAKE_OY
+.cr:
+    push cx
+    mov cx, SNAKE_COLS
+    mov dx, SNAKE_OX
+.cc:
+    push cx
+    push dx
+    mov ax, dx
+    mov dx, bx
+    ; draw 8x8 black cell at (ax, dx)
+    push bx
+    mov cx, 8
+.cy:
+    push cx
+    mov cx, 8
+    push ax
+    mov di, dx
+    imul di, di, 320
+    add di, ax
+    pop ax
+.cx:
+    mov byte [es:di], 0
+    inc di
+    loop .cx
+    inc dx
+    pop cx
+    loop .cy
+    pop bx
+    pop dx
+    pop cx
+    add dx, SNAKE_CELL
+    loop .cc
+    pop cx
+    add bx, SNAKE_CELL
+    loop .cr
+
+    pop es
+
+    ; Draw food
+    mov al, [snk_fx]
+    mov ah, 0
+    mov cx, ax
+    imul cx, cx, SNAKE_CELL
+    add cx, SNAKE_OX
+    mov al, [snk_fy]
+    mov ah, 0
+    mov dx, ax
+    imul dx, dx, SNAKE_CELL
+    add dx, SNAKE_OY
+    mov al, 0x0C            ; red
+    call snk_fill_cell
+
+    ; Draw body
+    mov bx, [snk_len]
+    xor si, si              ; index 0
+.db:
+    cmp si, bx
+    jge .dbd
+    mov ax, si
+    shl ax, 1
+    mov di, ax
+    mov al, [snk_body+di]
+    mov ah, 0
+    mov cx, ax
+    imul cx, cx, SNAKE_CELL
+    add cx, SNAKE_OX
+    mov al, [snk_body+di+1]
+    mov ah, 0
+    mov dx, ax
+    imul dx, dx, SNAKE_CELL
+    add dx, SNAKE_OY
+    ; color: head bright green (0x0A), body darker green (0x02)
+    push bx
+    push si
+    mov ax, [snk_head]
+    cmp si, ax
+    jne .body_col
+    mov al, 0x0A
+    jmp .draw_seg
+.body_col:
+    mov al, 0x02
+.draw_seg:
+    pop si
+    pop bx
+    call snk_fill_cell
+    inc si
+    jmp .db
+.dbd:
+
+    ; Score
+    call snk_show_score
+    popa
+    ret
+
+snk_fill_cell:
+    ; AL=color, CX=x, DX=y; draw 8x8
+    push es
+    push di
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+
+    mov bx, 0xA000
+    mov es, bx
+    mov si, 8           ; row count
+    mov ah, al          ; save color in AH
+.r:
+    push cx
+    mov bx, dx
+    imul bx, bx, 320
+    add bx, cx
+    mov di, bx
+    mov cx, 8
+    mov al, ah
+.c:
+    mov [es:di], al
+    inc di
+    loop .c
+    inc dx
+    pop cx
+    dec si
+    jnz .r
+
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    pop di
+    pop es
+    ret
+
+snk_place_food:
+    pusha
+.try:
+    xor ah, ah
+    int 0x1A                ; CX:DX = ticks
+    mov ax, dx
+    xor ah, ah
+    mov bl, SNAKE_COLS
+    div bl                  ; AH = AX mod COLS
+    mov [snk_fx], ah
+
+    mov ax, cx
+    xor ah, ah
+    mov bl, SNAKE_ROWS
+    div bl
+    mov [snk_fy], ah
+
+    ; Make sure it isn't on the snake
+    mov si, snk_body
+    mov cx, [snk_len]
+.ck:
+    cmp cx, 0
+    je .ok
+    mov al, [si]
+    cmp al, [snk_fx]
+    jne .nxt
+    mov al, [si+1]
+    cmp al, [snk_fy]
+    jne .nxt
+    ; collision -> retry
+    add si, 2               ; (cleanup not strictly needed)
+    jmp .try
+.nxt:
+    add si, 2
+    dec cx
+    jmp .ck
+.ok:
+    popa
+    ret
+
+snk_show_score:
+    pusha
+    ; Print SCORE: NNN at top-right corner
+    mov bp, snk_scorelbl
+    mov cx, 7
+    mov dh, 0
+    mov dl, 32
+    mov bl, 0x0F
+    call gfx_print
+    ; Render number
+    mov ax, [snk_score]
+    ; Convert to up-to-3 digit decimal at (row 0, col 39) using BIOS teletype
+    mov ah, 0x02
+    mov bh, 0
+    mov dh, 0
+    mov dl, 39
+    int 0x10
+    mov ax, [snk_score]
+    call snk_print_dec
+    popa
+    ret
+
+snk_print_dec:
+    push ax
+    push bx
+    push cx
+    push dx
+    xor cx, cx
+    mov bx, 10
+    cmp ax, 0
+    jne .pl
+    mov al, '0'
+    call putc_at_cursor
+    jmp .pd
+.pl:
+    cmp ax, 0
+    je .em
+    xor dx, dx
+    div bx
+    push dx
+    inc cx
+    jmp .pl
+.em:
+    cmp cx, 0
+    je .pd
+    pop ax
+    add al, '0'
+    call putc_at_cursor
+    dec cx
+    jmp .em
+.pd:
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; ============================================================
+; STARFIELD demo
+; ============================================================
+STAR_COUNT  equ 48
+
+gfx_app_starfield:
+    xor al, al
+    call gfx_fill
+
+    mov bp, sf_hint
+    mov cx, 18
+    mov dh, 24
+    mov dl, 11
+    mov bl, 0x0F
+    call gfx_print
+
+    ; Initialize stars from RTC
+    mov cx, STAR_COUNT
+    mov di, sf_stars
+.init:
+    push cx
+    xor ah, ah
+    int 0x1A
+    mov ax, dx
+    xor dx, dx
+    mov bx, 320
+    div bx
+    mov [di+0], dx          ; x
+    mov ax, cx
+    xor dx, dx
+    mov bx, 200
+    div bx
+    mov [di+2], dx          ; y
+    pop cx
+    push cx
+    mov ax, cx
+    and ax, 0x7F
+    add ax, 1
+    mov [di+4], ax          ; z (depth/speed)
+    add di, 6
+    pop cx
+    loop .init
+
+.sf_loop:
+    mov ah, 0x01
+    int 0x16
+    jz .nk
+    mov ah, 0x00
+    int 0x16
+    cmp ah, 0x01
+    je .done
+.nk:
+    ; Erase old stars: redraw each black, then move, then draw white
+    mov cx, STAR_COUNT
+    mov di, sf_stars
+.advance:
+    push cx
+    push di
+    ; erase
+    mov cx, [di+0]
+    mov dx, [di+2]
+    xor al, al
+    call gfx_putpixel
+    ; advance
+    mov ax, [di+4]
+    shr ax, 4
+    add ax, 1
+    add [di+0], ax
+    mov ax, [di+0]
+    cmp ax, 320
+    jl .ok
+    ; recycle: reset x to 0, randomize y
+    mov word [di+0], 0
+    xor ah, ah
+    int 0x1A
+    mov ax, dx
+    xor dx, dx
+    mov bx, 200
+    div bx
+    mov [di+2], dx
+.ok:
+    ; draw with brightness depending on z
+    mov cx, [di+0]
+    mov dx, [di+2]
+    mov al, 0x0F
+    mov bx, [di+4]
+    cmp bx, 50
+    jg .br
+    mov al, 0x07
+    cmp bx, 20
+    jg .br
+    mov al, 0x08
+.br:
+    call gfx_putpixel
+    pop di
+    pop cx
+    add di, 6
+    loop .advance
+
+    ; small delay
+    mov cx, 0x0002
+.do:
+    push cx
+    mov cx, 0xFFFF
+.di:
+    dec cx
+    jnz .di
+    pop cx
+    loop .do
+    jmp .sf_loop
+.done:
+    ret
+
+; ============================================================
+; TOMMY'S C — English-like mini language
+;   Programs live in ed_buf, one statement per line.
+;   See str_manual for syntax.
+; ============================================================
+TC_BLK_IF    equ 1
+TC_BLK_REP   equ 2
+
+; tc_word: DI = 0-terminated keyword, SI = cursor.
+;   If SI starts with the keyword followed by space/0/CR, advances SI past
+;   the keyword and returns ZF=1. Otherwise SI is unchanged and ZF=0.
+;   Trashes AL.
+tc_word:
+    push bx
+    push di
+    mov bx, si
+.tw_l:
+    mov al, [di]
+    or al, al
+    jz .tw_eos
+    cmp al, [si]
+    jne .tw_no
+    inc si
+    inc di
+    jmp .tw_l
+.tw_eos:
+    mov al, [si]
+    or al, al
+    je .tw_yes
+    cmp al, ' '
+    je .tw_yes
+    cmp al, 0x0D
+    je .tw_yes
+.tw_no:
+    mov si, bx
+    pop di
+    pop bx
+    mov al, 1
+    or al, al               ; ZF=0
+    ret
+.tw_yes:
+    pop di
+    pop bx
+    xor al, al              ; ZF=1
+    ret
+
+; tc_read_name: copies a sequence of letters at SI into tc_name_buf
+;   (null-terminated, up to 8 chars). Advances SI past the name.
+tc_read_name:
+    push cx
+    push di
+    mov di, tc_name_buf
+    mov cx, 8
+.rn:
+    mov al, [si]
+    cmp al, 'A'
+    jb .done
+    cmp al, 'Z'
+    jbe .store
+    cmp al, 'a'
+    jb .done
+    cmp al, 'z'
+    ja .done
+.store:
+    mov [di], al
+    inc di
+    inc si
+    dec cx
+    jnz .rn
+.done:
+    mov byte [di], 0
+    pop di
+    pop cx
+    ret
+
+; tc_find_var: search tc_var_names for tc_name_buf.
+;   Returns AX = slot index, or 0xFFFF if not found.
+tc_find_var:
+    push si
+    push di
+    push cx
+    push bx
+    mov bx, tc_var_names
+    xor cx, cx
+.fv:
+    cmp cx, 16
+    jge .nope
+    cmp byte [bx], 0
+    je .next
+    mov si, tc_name_buf
+    mov di, bx
+.cmp:
+    mov al, [si]
+    cmp al, [di]
+    jne .ne
+    or al, al
+    jz .eq
+    inc si
+    inc di
+    jmp .cmp
+.ne:
+    jmp .next
+.eq:
+    mov ax, cx
+    jmp .done
+.next:
+    add bx, 9
+    inc cx
+    jmp .fv
+.nope:
+    mov ax, 0xFFFF
+.done:
+    pop bx
+    pop cx
+    pop di
+    pop si
+    ret
+
+; tc_get_or_create_var: like tc_find_var but creates a new slot if missing.
+;   Returns AX = slot index (0 if table is full).
+tc_get_or_create_var:
+    call tc_find_var
+    cmp ax, 0xFFFF
+    jne .got
+    push si
+    push di
+    push cx
+    push bx
+    mov bx, tc_var_names
+    xor cx, cx
+.cr:
+    cmp cx, 16
+    jge .full
+    cmp byte [bx], 0
+    je .alloc
+    add bx, 9
+    inc cx
+    jmp .cr
+.alloc:
+    mov si, tc_name_buf
+    mov di, bx
+    push cx
+    mov cx, 9
+    rep movsb
+    pop cx
+    mov bx, cx
+    shl bx, 1
+    add bx, tc_var_vals
+    mov word [bx], 0
+    mov ax, cx
+    jmp .done2
+.full:
+    xor ax, ax
+.done2:
+    pop bx
+    pop cx
+    pop di
+    pop si
+.got:
+    ret
+
+; tc_find_var_or_zero: returns AX = value of variable in tc_name_buf,
+;   or 0 if it doesn't exist.
+tc_find_var_or_zero:
+    call tc_find_var
+    cmp ax, 0xFFFF
+    je .zero
+    shl ax, 1
+    push bx
+    mov bx, ax
+    add bx, tc_var_vals
+    mov ax, [bx]
+    pop bx
+    ret
+.zero:
+    xor ax, ax
+    ret
+
+; tc_eval: parse a number or variable name at SI. Returns AX = value.
+;   Advances SI past the token.
+tc_eval:
+    push bx
+    push cx
+    mov al, [si]
+    cmp al, '-'
+    je .neg
+    cmp al, '0'
+    jb .var
+    cmp al, '9'
+    ja .var
+    call parse_dec
+    jmp .done3
+.neg:
+    inc si
+    call parse_dec
+    neg ax
+    jmp .done3
+.var:
+    call tc_read_name
+    call tc_find_var_or_zero
+.done3:
+    pop cx
+    pop bx
+    ret
+
+; tc_print_num: prints AX as decimal at column 0 of current shell row.
+tc_print_num:
+    push ax
+    push bx
+    push dx
+    mov bx, ax
+    mov dh, [sh_row]
+    mov dl, 0
+    call setcursor
+    mov ax, bx
+    call print_dec_at_cursor
+    pop dx
+    pop bx
+    pop ax
+    ret
+
+; tc_err_unknown: print "?" error in red on current row.
+tc_err_unknown:
+    push si
+    push bx
+    push dx
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_RED
+    mov si, str_tc_err
+    call print_at
+    call sh_newline
+    pop dx
+    pop bx
+    pop si
+    ret
+
+; tc_line_ptr: SI := ed_buf + tc_pc * ED_LINE_LEN
+tc_line_ptr:
+    push ax
+    mov ax, [tc_pc]
+    imul ax, ax, ED_LINE_LEN
+    add ax, ed_buf
+    mov si, ax
+    pop ax
+    ret
+
+; tc_push_if: push an IF block onto the block stack.
+tc_push_if:
+    push ax
+    push bx
+    mov ax, [tc_bp]
+    cmp ax, 16
+    jge .full
+    imul bx, ax, 5
+    add bx, tc_blk_stack
+    mov byte [bx], TC_BLK_IF
+    inc word [tc_bp]
+.full:
+    pop bx
+    pop ax
+    ret
+
+; tc_push_rep: push a REP block. BX = counter, tc_pc = repeat line.
+tc_push_rep:
+    push ax
+    push di
+    mov ax, [tc_bp]
+    cmp ax, 16
+    jge .full
+    imul ax, ax, 5
+    add ax, tc_blk_stack
+    mov di, ax
+    mov byte [di], TC_BLK_REP
+    mov ax, [tc_pc]
+    mov [di+1], ax
+    mov [di+3], bx
+    inc word [tc_bp]
+.full:
+    pop di
+    pop ax
+    ret
+
+; tc_skip_block: advance tc_pc forward past the matching 'end',
+;   tracking nested if/repeat. Stops on the 'end' line itself
+;   (the main loop will then advance past it).
+tc_skip_block:
+    push cx
+    mov cx, 1
+.sk:
+    inc word [tc_pc]
+    mov ax, [tc_pc]
+    cmp ax, [ed_lines]
+    jge .done
+    call tc_line_ptr
+    call skip_spaces
+    mov al, [si]
+    or al, al
+    je .sk
+    cmp al, ';'
+    je .sk
+    mov di, tc_kw_if
+    call tc_word
+    je .open
+    mov di, tc_kw_repeat
+    call tc_word
+    je .open
+    mov di, tc_kw_end
+    call tc_word
+    je .close
+    jmp .sk
+.open:
+    inc cx
+    jmp .sk
+.close:
+    dec cx
+    jnz .sk
+.done:
+    pop cx
+    ret
+
+; tc_exec_line: execute the statement on the current line.
+tc_exec_line:
+    call tc_line_ptr
+    call skip_spaces
+    mov al, [si]
+    or al, al
+    je .ret
+    cmp al, ';'
+    je .ret
+
+    mov di, tc_kw_say
+    call tc_word
+    je .do_say
+    mov di, tc_kw_ask
+    call tc_word
+    je .do_ask
+    mov di, tc_kw_let
+    call tc_word
+    je .do_let
+    mov di, tc_kw_add
+    call tc_word
+    je .do_add
+    mov di, tc_kw_take
+    call tc_word
+    je .do_take
+    mov di, tc_kw_times
+    call tc_word
+    je .do_times
+    mov di, tc_kw_divide
+    call tc_word
+    je .do_divide
+    mov di, tc_kw_modulo
+    call tc_word
+    je .do_modulo
+    mov di, tc_kw_if
+    call tc_word
+    je .do_if
+    mov di, tc_kw_repeat
+    call tc_word
+    je .do_repeat
+    mov di, tc_kw_end
+    call tc_word
+    je .do_end
+    mov di, tc_kw_stop
+    call tc_word
+    je .do_stop
+
+    call tc_err_unknown
+.ret:
+    ret
+
+.do_say:
+    call skip_spaces
+    mov al, [si]
+    cmp al, '"'
+    je .say_str
+    cmp al, 0
+    je .say_blank
+    call tc_eval
+    call tc_print_num
+    call sh_newline
+    ret
+.say_blank:
+    call sh_newline
+    ret
+.say_str:
+    inc si
+    push di
+    mov di, tc_str_buf
+.sy_copy:
+    mov al, [si]
+    or al, al
+    je .sy_end
+    cmp al, '"'
+    je .sy_end
+    mov [di], al
+    inc di
+    inc si
+    jmp .sy_copy
+.sy_end:
+    mov byte [di], 0
+    pop di
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_BRIGHT
+    mov si, tc_str_buf
+    call print_at
+    call sh_newline
+    ret
+
+.do_ask:
+    call skip_spaces
+    call tc_read_name
+    call tc_get_or_create_var
+    push ax
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_CYAN
+    mov si, str_tc_prompt
+    call print_at
+    mov dh, [sh_row]
+    mov dl, 4
+    call setcursor
+    push di
+    mov di, tc_str_buf
+    mov cx, 20
+    call readline_echo
+    pop di
+    call sh_newline
+    mov si, tc_str_buf
+    call skip_spaces
+    call tc_eval
+    pop bx
+    shl bx, 1
+    add bx, tc_var_vals
+    mov [bx], ax
+    ret
+
+.do_let:
+    call skip_spaces
+    call tc_read_name
+    call tc_get_or_create_var
+    push ax
+    call skip_spaces
+    mov di, tc_kw_be
+    call tc_word
+    call skip_spaces
+    call tc_eval
+    pop bx
+    shl bx, 1
+    add bx, tc_var_vals
+    mov [bx], ax
+    ret
+
+.do_add:
+    call skip_spaces
+    call tc_eval
+    push ax
+    call skip_spaces
+    mov di, tc_kw_to
+    call tc_word
+    call skip_spaces
+    call tc_read_name
+    call tc_get_or_create_var
+    mov bx, ax
+    shl bx, 1
+    add bx, tc_var_vals
+    pop ax
+    add [bx], ax
+    ret
+
+.do_take:
+    call skip_spaces
+    call tc_eval
+    push ax
+    call skip_spaces
+    mov di, tc_kw_from
+    call tc_word
+    call skip_spaces
+    call tc_read_name
+    call tc_get_or_create_var
+    mov bx, ax
+    shl bx, 1
+    add bx, tc_var_vals
+    pop ax
+    sub [bx], ax
+    ret
+
+.do_times:
+    call skip_spaces
+    call tc_eval
+    push ax
+    call skip_spaces
+    mov di, tc_kw_by
+    call tc_word
+    call skip_spaces
+    call tc_read_name
+    call tc_get_or_create_var
+    mov bx, ax
+    shl bx, 1
+    add bx, tc_var_vals
+    pop ax
+    mov cx, [bx]
+    imul ax, cx
+    mov [bx], ax
+    ret
+
+.do_divide:
+    ; divide N by x  ->  x = x / N
+    call skip_spaces
+    call tc_eval            ; AX = N (divisor)
+    push ax
+    call skip_spaces
+    mov di, tc_kw_by
+    call tc_word
+    call skip_spaces
+    call tc_read_name
+    call tc_get_or_create_var
+    mov bx, ax
+    shl bx, 1
+    add bx, tc_var_vals
+    pop cx                  ; CX = divisor
+    cmp cx, 0
+    je .dv_skip
+    mov ax, [bx]
+    xor dx, dx
+    div cx
+    mov [bx], ax
+.dv_skip:
+    ret
+
+.do_modulo:
+    ; modulo N by x  ->  x = x mod N
+    call skip_spaces
+    call tc_eval            ; AX = N (modulus)
+    push ax
+    call skip_spaces
+    mov di, tc_kw_by
+    call tc_word
+    call skip_spaces
+    call tc_read_name
+    call tc_get_or_create_var
+    mov bx, ax
+    shl bx, 1
+    add bx, tc_var_vals
+    pop cx                  ; CX = modulus
+    cmp cx, 0
+    je .mo_skip
+    mov ax, [bx]
+    xor dx, dx
+    div cx
+    mov [bx], dx            ; DX = remainder
+.mo_skip:
+    ret
+
+.do_if:
+    call skip_spaces
+    call tc_read_name
+    call tc_find_var_or_zero
+    push ax
+    call skip_spaces
+    mov di, tc_kw_is
+    call tc_word
+    call skip_spaces
+    xor cx, cx
+    mov di, tc_kw_not
+    call tc_word
+    jne .if_cmp
+    mov cx, 1
+    call skip_spaces
+.if_cmp:
+    call tc_eval
+    pop bx
+    cmp bx, ax
+    jne .if_ne
+    ; equal
+    cmp cx, 0
+    je .if_take
+    jmp .if_skip
+.if_ne:
+    cmp cx, 1
+    je .if_take
+    jmp .if_skip
+.if_take:
+    call tc_push_if
+    ret
+.if_skip:
+    call tc_skip_block
+    ret
+
+.do_repeat:
+    call skip_spaces
+    call tc_eval
+    cmp ax, 0
+    jle .rp_zero
+    mov bx, ax
+    call tc_push_rep
+    ret
+.rp_zero:
+    call tc_skip_block
+    ret
+
+.do_end:
+    cmp word [tc_bp], 0
+    je .end_done
+    mov ax, [tc_bp]
+    dec ax
+    imul ax, ax, 5
+    add ax, tc_blk_stack
+    mov bx, ax
+    mov al, [bx]
+    cmp al, TC_BLK_REP
+    je .end_rep
+    ; IF block: pop and continue
+    dec word [tc_bp]
+.end_done:
+    ret
+.end_rep:
+    dec word [bx+3]
+    cmp word [bx+3], 0
+    jle .end_rep_pop
+    mov ax, [bx+1]
+    mov [tc_pc], ax
+    ret
+.end_rep_pop:
+    dec word [tc_bp]
+    ret
+
+.do_stop:
+    mov byte [tc_stop_flag], 1
+    ret
+
+; tc_run: run the program currently in ed_buf.
+tc_run:
+    mov word [tc_pc], 0
+    mov word [tc_bp], 0
+    mov byte [tc_stop_flag], 0
+
+    mov di, tc_var_names
+    mov cx, 16*9
+    xor al, al
+    rep stosb
+    mov di, tc_var_vals
+    mov cx, 16
+    xor ax, ax
+    rep stosw
+
+    call clrscr
+    call draw_titlebar
+    call draw_statusbar
+
+    mov dh, 2
+    mov dl, 0
+    mov bl, COL_GREEN
+    mov si, str_tc_hdr
+    call print_at
+
+    mov dh, 3
+    mov dl, 0
+    mov bl, COL_CYAN
+    mov cx, 80
+    mov al, 0xC4
+    call draw_hline
+
+    mov byte [sh_row], 5
+
+.next:
+    cmp byte [tc_stop_flag], 0
+    jne .end
+    mov ax, [tc_pc]
+    cmp ax, [ed_lines]
+    jge .end
+
+    call tc_exec_line
+
+    inc word [tc_pc]
+    jmp .next
+
+.end:
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_YELLOW
+    mov si, str_tc_done
+    call print_at
+    mov ah, 0x00
+    int 0x16
+
+    call clrscr
+    call draw_titlebar
+    call draw_statusbar
+    mov dh, 2
+    mov dl, 0
+    mov bl, COL_GREEN
+    mov si, str_shell_greet
+    call print_at
+    mov dh, 3
+    mov dl, 0
+    mov bl, COL_NORMAL
+    mov si, str_shell_hint
+    call print_at
+    mov dh, 4
+    mov dl, 0
+    mov bl, COL_CYAN
+    mov cx, 80
+    mov al, 0xC4
+    call draw_hline
+    mov byte [sh_row], 6
+    ret
+
+; ============================================================
+; FILE SAVE / LOAD — persist ed_buf to disk at LBA 65 (23 sectors).
+; ============================================================
+tc_save:
+    call sh_newline
+    mov ax, cs
+    mov [file_dap_seg], ax
+    mov ah, 0x43
+    mov al, 0
+    mov dl, [boot_drive]
+    mov si, file_dap
+    int 0x13
+    jc .err
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_GREEN
+    mov si, str_tc_save_ok
+    call print_at
+    call sh_newline
+    ret
+.err:
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_RED
+    mov si, str_tc_save_err
+    call print_at
+    call sh_newline
+    ret
+
+tc_load:
+    call sh_newline
+    mov ax, cs
+    mov [file_dap_seg], ax
+    push di
+    push cx
+    mov di, ed_buf
+    mov cx, MAX_ED_LINES * ED_LINE_LEN
+    xor al, al
+    rep stosb
+    pop cx
+    pop di
+    mov ah, 0x42
+    mov dl, [boot_drive]
+    mov si, file_dap
+    int 0x13
+    jc .err
+    call tc_recount_lines
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_GREEN
+    mov si, str_tc_load_ok
+    call print_at
+    call sh_newline
+    ret
+.err:
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_RED
+    mov si, str_tc_load_err
+    call print_at
+    call sh_newline
+    ret
+
+; Recount ed_lines based on contents of ed_buf.
+tc_recount_lines:
+    push bx
+    push cx
+    push ax
+    mov cx, MAX_ED_LINES
+.rc:
+    cmp cx, 0
+    je .none
+    dec cx
+    mov ax, cx
+    imul ax, ax, ED_LINE_LEN
+    add ax, ed_buf
+    mov bx, ax
+    mov ax, ED_LINE_LEN
+.scan:
+    cmp byte [bx], 0
+    jne .found
+    inc bx
+    dec ax
+    jnz .scan
+    jmp .rc
+.found:
+    inc cx
+    mov [ed_lines], cx
+    jmp .ret_lines
+.none:
+    mov word [ed_lines], 1
+.ret_lines:
+    pop ax
+    pop cx
+    pop bx
+    ret
+
+; ============================================================
+; ============================================================
+; TOMMYFS - persistent on-disk file system
+;
+; Layout:
+;   LBA 100         Superblock (magic "TMFS")
+;   LBA 101         Directory  (16 entries * 32 bytes)
+;   LBA 102+        File data  (each slot = 24 sectors = 12288 bytes)
+;
+; Directory entry (32 bytes):
+;   off 0      in-use flag (0=free, 1=used)
+;   off 1..16  zero-terminated name (up to 15 chars)
+;   off 17..18 file size in bytes (uint16)
+;   off 19..31 reserved
+;
+; LBA of file slot N data = 102 + N*24    (0 <= N < 16)
+; ============================================================
+
+FS_LBA_SUPER  equ 100
+FS_LBA_DIR    equ 101
+FS_LBA_DATA   equ 102
+FS_MAX_FILES  equ 16
+FS_ENTRY_SIZE equ 32
+FS_FILE_SECTS equ 23
+FS_FILE_BYTES equ (FS_FILE_SECTS * 512)
+FS_NAME_MAX   equ 15
+
+; ----- fs_load_super: read LBA 100 into fs_disk_buf, set fs_ok = 1 on success -----
+fs_load_super:
+    pusha
+    mov ax, cs
+    mov [fs_dap_seg], ax
+    mov word [fs_dap_count], 1
+    mov word [fs_dap_off], fs_disk_buf
+    mov dword [fs_dap_lba], FS_LBA_SUPER
+    mov byte [fs_ok], 0
+    mov ah, 0x42
+    mov dl, [boot_drive]
+    mov si, fs_dap
+    int 0x13
+    jc .d
+    mov byte [fs_ok], 1
+.d: popa
+    ret
+
+; ----- fs_save_super: write fs_disk_buf to LBA 100 -----
+fs_save_super:
+    pusha
+    mov ax, cs
+    mov [fs_dap_seg], ax
+    mov word [fs_dap_count], 1
+    mov word [fs_dap_off], fs_disk_buf
+    mov dword [fs_dap_lba], FS_LBA_SUPER
+    mov byte [fs_ok], 0
+    mov ah, 0x43
+    mov al, 0
+    mov dl, [boot_drive]
+    mov si, fs_dap
+    int 0x13
+    jc .d
+    mov byte [fs_ok], 1
+.d: popa
+    ret
+
+; ----- fs_load_dir: read LBA 101 into fs_dir_buf, sets fs_ok -----
+fs_load_dir:
+    pusha
+    mov ax, cs
+    mov [fs_dap_seg], ax
+    mov word [fs_dap_count], 1
+    mov word [fs_dap_off], fs_dir_buf
+    mov dword [fs_dap_lba], FS_LBA_DIR
+    mov byte [fs_ok], 0
+    mov ah, 0x42
+    mov dl, [boot_drive]
+    mov si, fs_dap
+    int 0x13
+    jc .d
+    mov byte [fs_ok], 1
+.d: popa
+    ret
+
+; ----- fs_save_dir: write fs_dir_buf to LBA 101 -----
+fs_save_dir:
+    pusha
+    mov ax, cs
+    mov [fs_dap_seg], ax
+    mov word [fs_dap_count], 1
+    mov word [fs_dap_off], fs_dir_buf
+    mov dword [fs_dap_lba], FS_LBA_DIR
+    mov byte [fs_ok], 0
+    mov ah, 0x43
+    mov al, 0
+    mov dl, [boot_drive]
+    mov si, fs_dap
+    int 0x13
+    jc .d
+    mov byte [fs_ok], 1
+.d: popa
+    ret
+
+; ----- fs_check: returns AL=1 if formatted, AL=0 otherwise -----
+fs_check:
+    call fs_load_super
+    cmp byte [fs_ok], 1
+    jne .no
+    cmp dword [fs_disk_buf], 0x53464D54   ; "TMFS" little endian
+    jne .no
+    mov al, 1
+    ret
+.no:
+    xor al, al
+    ret
+
+; ----- fs_format: build superblock + empty directory, write both -----
+fs_format:
+    pusha
+    ; -- Build superblock --
+    mov di, fs_disk_buf
+    xor al, al
+    mov cx, 512
+    rep stosb
+    mov dword [fs_disk_buf], 0x53464D54   ; "TMFS"
+    mov word  [fs_disk_buf+4], 1          ; version
+    mov word  [fs_disk_buf+6], FS_MAX_FILES
+    mov dword [fs_disk_buf+8], FS_FILE_SECTS
+    call fs_save_super
+
+    ; -- Empty directory --
+    mov di, fs_dir_buf
+    xor al, al
+    mov cx, 512
+    rep stosb
+    call fs_save_dir
+    popa
+    ret
+
+; ----- fs_entry_ptr: BX <- pointer to entry at index AL (0..15) -----
+fs_entry_ptr:
+    push ax
+    movzx bx, al
+    shl bx, 5            ; * 32
+    add bx, fs_dir_buf
+    pop ax
+    ret
+
+; ----- fs_name_match: compare zero-terminated SI to DI, ZF set if equal -----
+fs_name_match:
+    push si
+    push di
+    push ax
+.nm:
+    mov al, [si]
+    mov ah, [di]
+    cmp al, ah
+    jne .no
+    or al, al
+    je .yes
+    inc si
+    inc di
+    jmp .nm
+.no:
+    pop ax
+    pop di
+    pop si
+    or ax, 1
+    cmp ax, 0
+    ret
+.yes:
+    pop ax
+    pop di
+    pop si
+    xor ax, ax
+    cmp ax, 0
+    ret
+
+; ----- fs_find: search dir for name pointed to by SI.
+;       On hit: AL = index, ZF=1.  On miss: ZF=0. -----
+fs_find:
+    push bx
+    push cx
+    push si
+    mov cx, FS_MAX_FILES
+    xor al, al
+.fl:
+    push ax
+    call fs_entry_ptr
+    cmp byte [bx], 1
+    jne .skip
+    push si
+    mov di, bx
+    inc di                 ; entry name field
+    call fs_name_match
+    pop si
+    je .found
+.skip:
+    pop ax
+    inc al
+    cmp al, FS_MAX_FILES
+    jl .fl
+    pop si
+    pop cx
+    pop bx
+    or al, 1               ; clear ZF
+    cmp al, 0
+    ret
+.found:
+    add sp, 2               ; drop pushed ax (preserve our AL)
+    pop si
+    pop cx
+    pop bx
+    xor ah, ah
+    cmp ah, 0               ; set ZF
+    ret
+
+; ----- fs_find_free: AL=first free index, ZF=1; else ZF=0 -----
+fs_find_free:
+    push bx
+    xor al, al
+.fl:
+    call fs_entry_ptr
+    cmp byte [bx], 0
+    je .got
+    inc al
+    cmp al, FS_MAX_FILES
+    jl .fl
+    pop bx
+    or al, 1
+    cmp al, 0
+    ret
+.got:
+    pop bx
+    xor ah, ah
+    cmp ah, 0
+    ret
+
+; ----- fs_file_lba: AL = slot index -> EAX = LBA of file data start -----
+fs_file_lba:
+    push bx
+    movzx bx, al
+    imul bx, bx, FS_FILE_SECTS
+    add bx, FS_LBA_DATA
+    movzx eax, bx
+    pop bx
+    ret
+
+; ----- fs_read_slot: AL = slot index. Reads FS_FILE_SECTS sectors -> ed_buf -----
+fs_read_slot:
+    pusha
+    call fs_file_lba
+    mov ax, cs
+    mov [fs_dap_seg], ax
+    mov word [fs_dap_count], FS_FILE_SECTS
+    mov word [fs_dap_off], ed_buf
+    push eax
+    pop dword [fs_dap_lba]
+    mov byte [fs_ok], 0
+    mov ah, 0x42
+    mov dl, [boot_drive]
+    mov si, fs_dap
+    int 0x13
+    jc .d
+    mov byte [fs_ok], 1
+.d: popa
+    ret
+
+; ----- fs_write_slot: AL = slot index. Writes ed_buf -> file data sectors -----
+fs_write_slot:
+    pusha
+    call fs_file_lba
+    mov ax, cs
+    mov [fs_dap_seg], ax
+    mov word [fs_dap_count], FS_FILE_SECTS
+    mov word [fs_dap_off], ed_buf
+    push eax
+    pop dword [fs_dap_lba]
+    mov byte [fs_ok], 0
+    mov ah, 0x43
+    mov al, 0
+    mov dl, [boot_drive]
+    mov si, fs_dap
+    int 0x13
+    jc .d
+    mov byte [fs_ok], 1
+.d: popa
+    ret
+
+; ----- fs_ensure_mounted: format if uninitialised -----
+fs_ensure_mounted:
+    call fs_check
+    test al, al
+    jnz .ok
+    call fs_format
+.ok:
+    call fs_load_dir
+    ret
+
+; ============================================================
+; CMD: fs_init - reformat the file system (asks for confirmation)
+; ============================================================
+cmd_fs_init:
+    call sh_newline
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_YELLOW
+    mov si, str_fs_init_q
+    call print_at
+    mov dh, [sh_row]
+    mov dl, 30
+    call setcursor
+    mov ah, 0
+    int 0x16
+    cmp al, 'y'
+    je .doit
+    cmp al, 'Y'
+    je .doit
+    call sh_newline
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_NORMAL
+    mov si, str_fs_cancel
+    call print_at
+    call sh_newline
+    ret
+.doit:
+    call fs_format
+    call sh_newline
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_GREEN
+    mov si, str_fs_formatted
+    call print_at
+    call sh_newline
+    ret
+
+; ============================================================
+; CMD: dir - list files in TommyFS
+; ============================================================
+cmd_dir:
+    call sh_newline
+    call fs_ensure_mounted
+    cmp byte [fs_ok], 1
+    jne .err
+
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_CYAN
+    mov si, str_dir_hdr
+    call print_at
+    call sh_newline
+
+    mov word [fs_used], 0
+    xor al, al
+.lp:
+    push ax
+    call fs_entry_ptr
+    cmp byte [bx], 1
+    jne .next
+
+    inc word [fs_used]
+    ; print "  NAME............  NNNN bytes"
+    mov dh, [sh_row]
+    mov dl, 2
+    call setcursor
+    push bx
+    inc bx                  ; -> name
+    mov si, bx
+    call print_str_at_cursor
+    pop bx
+
+    mov dh, [sh_row]
+    mov dl, 22
+    call setcursor
+    mov ax, [bx+17]
+    call print_dec_at_cursor
+    mov si, str_dir_bytes
+    call print_str_at_cursor
+    call sh_newline
+
+.next:
+    pop ax
+    inc al
+    cmp al, FS_MAX_FILES
+    jl .lp
+
+    cmp word [fs_used], 0
+    jne .footer
+    mov dh, [sh_row]
+    mov dl, 2
+    mov bl, COL_NORMAL
+    mov si, str_dir_empty
+    call print_at
+    call sh_newline
+.footer:
+    mov dh, [sh_row]
+    mov dl, 2
+    mov bl, COL_YELLOW
+    mov si, str_dir_used
+    call print_at
+    mov dh, [sh_row]
+    mov dl, 9
+    call setcursor
+    mov ax, [fs_used]
+    call print_dec_at_cursor
+    mov si, str_dir_of
+    call print_str_at_cursor
+    mov ax, FS_MAX_FILES
+    call print_dec_at_cursor
+    mov si, str_dir_files
+    call print_str_at_cursor
+    call sh_newline
+    ret
+.err:
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_RED
+    mov si, str_fs_err
+    call print_at
+    call sh_newline
+    ret
+
+; ============================================================
+; arg_after_cmd: SI points just past the command word.
+; Skips spaces, copies word (up to 15 chars) into arg_name[].
+; Returns CX = length.
+; ============================================================
+arg_after_cmd:
+    push ax
+    push di
+    call skip_spaces
+    mov di, arg_name
+    xor cx, cx
+.copy:
+    mov al, [si]
+    cmp al, 0
+    je .done
+    cmp al, ' '
+    je .done
+    cmp al, 0x0D
+    je .done
+    cmp cx, FS_NAME_MAX
+    jge .skip
+    mov [di], al
+    inc di
+.skip:
+    inc si
+    inc cx
+    jmp .copy
+.done:
+    mov byte [di], 0
+    pop di
+    pop ax
+    ret
+
+; Skip first command word in cmd_buf, leaving SI at the rest
+skip_first_word:
+    mov si, cmd_buf
+    call skip_spaces
+.sw:
+    mov al, [si]
+    cmp al, 0
+    je .done
+    cmp al, ' '
+    je .done
+    cmp al, 0x0D
+    je .done
+    inc si
+    jmp .sw
+.done:
+    ret
+
+; ============================================================
+; CMD: cat <name>
+; ============================================================
+cmd_cat:
+    call sh_newline
+    call fs_ensure_mounted
+    call skip_first_word
+    call arg_after_cmd
+    cmp byte [arg_name], 0
+    je .usage
+
+    mov si, arg_name
+    call fs_find
+    jne .nf
+
+    push ax
+    call fs_entry_ptr
+    mov ax, [bx+17]              ; size
+    mov [cat_size], ax
+    pop ax
+
+    call fs_read_slot
+    cmp byte [fs_ok], 1
+    jne .err
+
+    ; Print ed_buf, up to cat_size bytes, handling 0x0A as newlines
+    mov si, ed_buf
+    mov cx, [cat_size]
+    cmp cx, 0
+    je .empty
+.line:
+    mov dh, [sh_row]
+    mov dl, 2
+    call setcursor
+.ch:
+    cmp cx, 0
+    je .pdone
+    lodsb
+    dec cx
+    cmp al, 0
+    je .pdone
+    cmp al, 0x0A
+    je .nl
+    cmp al, 0x0D
+    je .ch
+    call putc_at_cursor
+    jmp .ch
+.nl:
+    call sh_newline
+    jmp .line
+.pdone:
+    call sh_newline
+    ret
+.empty:
+    mov dh, [sh_row]
+    mov dl, 2
+    mov bl, COL_NORMAL
+    mov si, str_cat_empty
+    call print_at
+    call sh_newline
+    ret
+.usage:
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_YELLOW
+    mov si, str_cat_usage
+    call print_at
+    call sh_newline
+    ret
+.nf:
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_RED
+    mov si, str_fs_nf
+    call print_at
+    call sh_newline
+    ret
+.err:
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_RED
+    mov si, str_fs_err
+    call print_at
+    call sh_newline
+    ret
+
+; ============================================================
+; CMD: del <name>
+; ============================================================
+cmd_del:
+    call sh_newline
+    call fs_ensure_mounted
+    call skip_first_word
+    call arg_after_cmd
+    cmp byte [arg_name], 0
+    je .usage
+
+    mov si, arg_name
+    call fs_find
+    jne .nf
+
+    call fs_entry_ptr
+    mov byte [bx], 0          ; clear in-use
+    push bx
+    add bx, 1
+    mov di, bx
+    xor al, al
+    mov cx, FS_ENTRY_SIZE-1
+    rep stosb
+    pop bx
+    call fs_save_dir
+
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_GREEN
+    mov si, str_del_ok
+    call print_at
+    call sh_newline
+    ret
+.usage:
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_YELLOW
+    mov si, str_del_usage
+    call print_at
+    call sh_newline
+    ret
+.nf:
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_RED
+    mov si, str_fs_nf
+    call print_at
+    call sh_newline
+    ret
+
+; ============================================================
+; CMD: write <name>  - save ed_buf into named file
+; ============================================================
+cmd_write:
+    call sh_newline
+    call fs_ensure_mounted
+    call skip_first_word
+    call arg_after_cmd
+    cmp byte [arg_name], 0
+    je .usage
+
+    ; If exists, overwrite. Else find free slot.
+    mov si, arg_name
+    call fs_find
+    je .have_slot
+    call fs_find_free
+    jne .full
+.have_slot:
+    push ax                   ; save slot index
+
+    ; Compute byte size used in ed_buf (look for trailing zeros)
+    call ed_buf_size_used
+    mov [write_size], ax
+
+    pop ax
+    push ax
+    call fs_entry_ptr
+    mov byte [bx], 1
+    ; Copy name (up to 15 chars + null)
+    push di
+    push si
+    push cx
+    lea di, [bx+1]
+    mov si, arg_name
+    mov cx, FS_NAME_MAX+1
+    rep movsb
+    pop cx
+    pop si
+    pop di
+    mov ax, [write_size]
+    mov [bx+17], ax
+
+    pop ax
+    call fs_write_slot
+    cmp byte [fs_ok], 1
+    jne .err
+    call fs_save_dir
+
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_GREEN
+    mov si, str_write_ok
+    call print_at
+    call sh_newline
+    ret
+.usage:
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_YELLOW
+    mov si, str_write_usage
+    call print_at
+    call sh_newline
+    ret
+.full:
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_RED
+    mov si, str_fs_full
+    call print_at
+    call sh_newline
+    ret
+.err:
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_RED
+    mov si, str_fs_err
+    call print_at
+    call sh_newline
+    ret
+
+; Compute used byte count in ed_buf (last non-zero+1, capped to FS_FILE_BYTES)
+ed_buf_size_used:
+    push bx
+    push cx
+    mov bx, MAX_ED_LINES * ED_LINE_LEN
+.scan:
+    cmp bx, 0
+    je .done
+    dec bx
+    cmp byte [ed_buf + bx], 0
+    je .scan
+    inc bx
+.done:
+    mov ax, bx
+    cmp ax, FS_FILE_BYTES
+    jbe .ok
+    mov ax, FS_FILE_BYTES
+.ok:
+    pop cx
+    pop bx
+    ret
+
+; ============================================================
+; CMD: read <name>  - load named file into ed_buf
+; ============================================================
+cmd_read:
+    call sh_newline
+    call fs_ensure_mounted
+    call skip_first_word
+    call arg_after_cmd
+    cmp byte [arg_name], 0
+    je .usage
+
+    mov si, arg_name
+    call fs_find
+    jne .nf
+
+    ; Clear ed_buf first
+    push ax
+    push di
+    push cx
+    mov di, ed_buf
+    mov cx, MAX_ED_LINES * ED_LINE_LEN
+    xor al, al
+    rep stosb
+    pop cx
+    pop di
+    pop ax
+
+    call fs_read_slot
+    cmp byte [fs_ok], 1
+    jne .err
+    call tc_recount_lines
+
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_GREEN
+    mov si, str_read_ok
+    call print_at
+    call sh_newline
+    ret
+.usage:
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_YELLOW
+    mov si, str_read_usage
+    call print_at
+    call sh_newline
+    ret
+.nf:
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_RED
+    mov si, str_fs_nf
+    call print_at
+    call sh_newline
+    ret
+.err:
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_RED
+    mov si, str_fs_err
+    call print_at
+    call sh_newline
+    ret
+
+; ============================================================
+; CMD: df - disk usage summary
+; ============================================================
+cmd_df:
+    call sh_newline
+    call fs_ensure_mounted
+
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_CYAN
+    mov si, str_df_hdr
+    call print_at
+    call sh_newline
+
+    ; count used files, sum bytes
+    mov word [fs_used], 0
+    mov word [fs_total_bytes], 0
+    xor al, al
+.lp:
+    push ax
+    call fs_entry_ptr
+    cmp byte [bx], 1
+    jne .next
+    inc word [fs_used]
+    mov cx, [bx+17]
+    add [fs_total_bytes], cx
+.next:
+    pop ax
+    inc al
+    cmp al, FS_MAX_FILES
+    jl .lp
+
+    ; Files line
+    mov dh, [sh_row]
+    mov dl, 2
+    mov bl, COL_NORMAL
+    mov si, str_df_files
+    call print_at
+    mov dh, [sh_row]
+    mov dl, 16
+    call setcursor
+    mov ax, [fs_used]
+    call print_dec_at_cursor
+    mov si, str_dir_of
+    call print_str_at_cursor
+    mov ax, FS_MAX_FILES
+    call print_dec_at_cursor
+    call sh_newline
+
+    ; Used bytes line
+    mov dh, [sh_row]
+    mov dl, 2
+    mov bl, COL_NORMAL
+    mov si, str_df_used
+    call print_at
+    mov dh, [sh_row]
+    mov dl, 16
+    call setcursor
+    mov ax, [fs_total_bytes]
+    call print_dec_at_cursor
+    mov si, str_dir_bytes
+    call print_str_at_cursor
+    call sh_newline
+
+    ; Slot size line
+    mov dh, [sh_row]
+    mov dl, 2
+    mov bl, COL_NORMAL
+    mov si, str_df_slot
+    call print_at
+    mov dh, [sh_row]
+    mov dl, 16
+    call setcursor
+    mov ax, FS_FILE_BYTES
+    call print_dec_at_cursor
+    mov si, str_dir_bytes
+    call print_str_at_cursor
+    call sh_newline
+    ret
+
+; ============================================================
+; CMD: hist - print command history (oldest -> newest)
+; ============================================================
+cmd_hist:
+    call sh_newline
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_CYAN
+    mov si, str_hist_hdr
+    call print_at
+    call sh_newline
+    movzx cx, byte [hist_count]
+    test cx, cx
+    jnz .lp
+    mov dh, [sh_row]
+    mov dl, 2
+    mov bl, COL_NORMAL
+    mov si, str_hist_empty
+    call print_at
+    call sh_newline
+    ret
+.lp:
+    movzx bx, byte [hist_count]
+    sub bx, cx
+    ; entry index = (hist_head - hist_count + bx) mod 8
+    movzx ax, byte [hist_head]
+    movzx dx, byte [hist_count]
+    sub ax, dx
+    add ax, bx
+    and ax, 7
+    imul ax, ax, MAX_CMD
+    add ax, hist_buf
+
+    mov dh, [sh_row]
+    mov dl, 2
+    push cx
+    push ax
+    mov bl, COL_NORMAL
+    mov si, ax
+    call print_at
+    pop ax
+    pop cx
+    call sh_newline
+    dec cx
+    jnz .lp
+    ret
+
+; ============================================================
+; CMD: clock - live clock until ESC pressed
+; ============================================================
+cmd_clock:
+    call sh_newline
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_YELLOW
+    mov si, str_clock_hint
+    call print_at
+    call sh_newline
+    mov byte [clk_row], 0
+    mov al, [sh_row]
+    mov [clk_row], al
+
+.tick:
+    ; Get time
+    mov ah, 0x02
+    int 0x1A
+
+    mov dh, [clk_row]
+    mov dl, 2
+    call setcursor
+    mov al, ch
+    call print_bcd_at_cursor
+    mov al, ':'
+    call putc_at_cursor
+    mov al, cl
+    call print_bcd_at_cursor
+    mov al, ':'
+    call putc_at_cursor
+    mov al, dh
+    call print_bcd_at_cursor
+
+    ; Wait ~250ms via tick count, polling keyboard
+    mov ah, 0x00
+    int 0x1A          ; CX:DX = ticks
+    mov bx, dx
+    add bx, 4         ; ~4 ticks ~= 220ms
+.poll:
+    mov ah, 0x01
+    int 0x16
+    jz .nokey
+    mov ah, 0
+    int 0x16
+    cmp al, 27        ; ESC
+    je .quit
+.nokey:
+    mov ah, 0x00
+    int 0x1A
+    cmp dx, bx
+    jb .poll
+    jmp .tick
+.quit:
+    call sh_newline
+    ret
+
+; ============================================================
+; CMD: hexdump <name> - show first 128 bytes of file as hex
+; ============================================================
+cmd_hexdump:
+    call sh_newline
+    call fs_ensure_mounted
+    call skip_first_word
+    call arg_after_cmd
+    cmp byte [arg_name], 0
+    je .usage
+
+    mov si, arg_name
+    call fs_find
+    jne .nf
+    call fs_read_slot
+    cmp byte [fs_ok], 1
+    jne .err
+
+    mov bx, 0          ; offset
+    mov cx, 8          ; 8 rows of 16 bytes = 128 bytes
+.row:
+    mov dh, [sh_row]
+    mov dl, 0
+    call setcursor
+    mov ax, bx
+    call print_hex_word_at_cursor
+    mov al, ':'
+    call putc_at_cursor
+    mov al, ' '
+    call putc_at_cursor
+
+    push cx
+    mov cx, 16
+.byte:
+    push bx
+    mov al, [ed_buf + bx]
+    call print_hex_byte_at_cursor
+    pop bx
+    inc bx
+    mov al, ' '
+    call putc_at_cursor
+    loop .byte
+    pop cx
+    call sh_newline
+    loop .row
+    ret
+.usage:
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_YELLOW
+    mov si, str_hex_usage
+    call print_at
+    call sh_newline
+    ret
+.nf:
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_RED
+    mov si, str_fs_nf
+    call print_at
+    call sh_newline
+    ret
+.err:
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_RED
+    mov si, str_fs_err
+    call print_at
+    call sh_newline
+    ret
+
+; ============================================================
+; CMD: ttt - tic-tac-toe game
+;
+; Board is a 3x3 grid; positions 1..9.
+; Player X, computer O. Player picks number; computer plays simple
+; corner/center/random strategy.
+; ============================================================
+cmd_ttt:
+    call sh_newline
+
+    ; Clear board
+    push di
+    push ax
+    mov di, ttt_cells
+    mov al, ' '
+    mov cx, 9
+    rep stosb
+    pop ax
+    pop di
+    mov byte [ttt_turn], 'X'
+
+    call ttt_draw_hdr
+    call ttt_draw_board
+
+.loop:
+    cmp byte [ttt_turn], 'X'
+    jne .ai
+
+    ; Player input
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_YELLOW
+    mov si, str_ttt_prompt
+    call print_at
+    mov dh, [sh_row]
+    mov dl, 14
+    call setcursor
+    mov ah, 0
+    int 0x16
+    cmp al, 27
+    je .quit
+    cmp al, '1'
+    jl .loop
+    cmp al, '9'
+    jg .loop
+    sub al, '1'             ; index 0..8
+    movzx bx, al
+    cmp byte [ttt_cells + bx], ' '
+    jne .loop
+    mov byte [ttt_cells + bx], 'X'
+    call sh_newline
+    call ttt_draw_board
+
+    call ttt_check
+    cmp al, 'X'
+    je .won
+    cmp al, 'D'
+    je .draw
+    mov byte [ttt_turn], 'O'
+    jmp .loop
+
+.ai:
+    call ttt_ai_move
+    call sh_newline
+    call ttt_draw_board
+    call ttt_check
+    cmp al, 'O'
+    je .lost
+    cmp al, 'D'
+    je .draw
+    mov byte [ttt_turn], 'X'
+    jmp .loop
+
+.won:
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_GREEN
+    mov si, str_ttt_won
+    call print_at
+    call sh_newline
+    ret
+.lost:
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_RED
+    mov si, str_ttt_lost
+    call print_at
+    call sh_newline
+    ret
+.draw:
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_YELLOW
+    mov si, str_ttt_draw
+    call print_at
+    call sh_newline
+    ret
+.quit:
+    call sh_newline
+    ret
+
+ttt_draw_hdr:
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_CYAN
+    mov si, str_ttt_hdr
+    call print_at
+    call sh_newline
+    ret
+
+ttt_draw_board:
+    ; Render 3x3 with separators, like:
+    ;   X | O | X
+    ;  ---+---+---
+    push bx
+    mov bx, 0
+.row:
+    mov dh, [sh_row]
+    mov dl, 2
+    call setcursor
+    mov al, [ttt_cells + bx]
+    call putc_at_cursor
+    mov al, ' '
+    call putc_at_cursor
+    mov al, '|'
+    call putc_at_cursor
+    mov al, ' '
+    call putc_at_cursor
+    mov al, [ttt_cells + bx + 1]
+    call putc_at_cursor
+    mov al, ' '
+    call putc_at_cursor
+    mov al, '|'
+    call putc_at_cursor
+    mov al, ' '
+    call putc_at_cursor
+    mov al, [ttt_cells + bx + 2]
+    call putc_at_cursor
+    call sh_newline
+
+    add bx, 3
+    cmp bx, 9
+    jge .done
+    mov dh, [sh_row]
+    mov dl, 2
+    mov bl, COL_NORMAL
+    mov si, str_ttt_sep
+    call print_at
+    call sh_newline
+    jmp .row
+.done:
+    pop bx
+    ret
+
+; ttt_check: return AL = 'X', 'O', 'D' (draw), or ' ' (none)
+ttt_check:
+    push bx
+    push cx
+    push si
+    mov si, ttt_wins
+.lp:
+    movzx bx, byte [si]
+    cmp bx, 0xFF
+    je .nowin
+    mov al, [ttt_cells + bx]
+    cmp al, ' '
+    je .nx
+    movzx bx, byte [si+1]
+    cmp al, [ttt_cells + bx]
+    jne .nx
+    movzx bx, byte [si+2]
+    cmp al, [ttt_cells + bx]
+    jne .nx
+    jmp .win
+.nx:
+    add si, 3
+    jmp .lp
+.nowin:
+    ; check draw
+    xor bx, bx
+.d:
+    cmp byte [ttt_cells + bx], ' '
+    je .ng
+    inc bx
+    cmp bx, 9
+    jl .d
+    mov al, 'D'
+    jmp .ret
+.ng:
+    mov al, ' '
+    jmp .ret
+.win:
+    ; AL already holds winner
+.ret:
+    pop si
+    pop cx
+    pop bx
+    ret
+
+; ttt_ai_move: simple AI. Try win, block, center, corner, random.
+ttt_ai_move:
+    ; Try to win
+    mov al, 'O'
+    call ttt_try_complete
+    cmp al, 0xFF
+    jne .place
+    ; Block X
+    mov al, 'X'
+    call ttt_try_complete
+    cmp al, 0xFF
+    jne .place
+    ; Center
+    cmp byte [ttt_cells + 4], ' '
+    jne .corners
+    mov al, 4
+    jmp .place
+.corners:
+    cmp byte [ttt_cells + 0], ' '
+    jne .c1
+    mov al, 0
+    jmp .place
+.c1:
+    cmp byte [ttt_cells + 2], ' '
+    jne .c2
+    mov al, 2
+    jmp .place
+.c2:
+    cmp byte [ttt_cells + 6], ' '
+    jne .c3
+    mov al, 6
+    jmp .place
+.c3:
+    cmp byte [ttt_cells + 8], ' '
+    jne .anyside
+    mov al, 8
+    jmp .place
+.anyside:
+    xor bx, bx
+.sl:
+    cmp byte [ttt_cells + bx], ' '
+    je .placed
+    inc bx
+    cmp bx, 9
+    jl .sl
+    ret
+.placed:
+    mov al, bl
+.place:
+    movzx bx, al
+    mov byte [ttt_cells + bx], 'O'
+    ret
+
+; AL = player char to try completing (i.e. find win for that player).
+; Returns AL = index of the move cell, or 0xFF if none.
+ttt_try_complete:
+    push bx
+    push cx
+    push dx
+    push si
+    mov dl, al                 ; target char
+    mov si, ttt_wins
+.lp:
+    movzx bx, byte [si]
+    cmp bx, 0xFF
+    je .none
+    mov ah, [ttt_cells + bx]
+    movzx bx, byte [si+1]
+    mov al, [ttt_cells + bx]
+    movzx bx, byte [si+2]
+    mov dh, [ttt_cells + bx]
+    ; Count matches of dl and presence of one ' '
+    xor cl, cl              ; matches
+    xor ch, ch              ; blank index encoding (0/1/2 +1)
+    cmp ah, dl
+    jne .a2
+    inc cl
+.a2:
+    cmp al, dl
+    jne .a3
+    inc cl
+.a3:
+    cmp dh, dl
+    jne .ck
+    inc cl
+.ck:
+    cmp cl, 2
+    jne .nx
+    ; find the blank one
+    cmp ah, ' '
+    jne .b2
+    movzx ax, byte [si]
+    jmp .got
+.b2:
+    cmp al, ' '
+    jne .b3
+    movzx ax, byte [si+1]
+    jmp .got
+.b3:
+    cmp dh, ' '
+    jne .nx
+    movzx ax, byte [si+2]
+.got:
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    ret
+.nx:
+    add si, 3
+    jmp .lp
+.none:
+    mov al, 0xFF
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    ret
+
+; Winning lines as triplets of cell indices, terminated by 0xFF
+ttt_wins:
+    db 0,1,2, 3,4,5, 6,7,8        ; rows
+    db 0,3,6, 1,4,7, 2,5,8        ; cols
+    db 0,4,8, 2,4,6               ; diags
+    db 0xFF
+
+; ============================================================
+; CMD: rename <old> <new> - rename a TommyFS file
+; ============================================================
+cmd_rename:
+    call sh_newline
+    call fs_ensure_mounted
+    call skip_first_word
+    call arg_after_cmd          ; arg_name = old name
+    cmp byte [arg_name], 0
+    je .rn_usage
+    ; save old name
+    push si
+    push di
+    push cx
+    mov si, arg_name
+    mov di, rename_buf
+    mov cx, FS_NAME_MAX + 1
+    rep movsb
+    pop cx
+    pop di
+    pop si
+    call arg_after_cmd          ; arg_name = new name
+    cmp byte [arg_name], 0
+    je .rn_usage
+    ; find old name
+    mov si, rename_buf
+    call fs_find
+    jne .rn_nf
+    ; update directory entry name field
+    call fs_entry_ptr           ; BX -> entry
+    push di
+    push si
+    push cx
+    lea di, [bx+1]
+    mov si, arg_name
+    mov cx, FS_NAME_MAX + 1
+    rep movsb
+    pop cx
+    pop si
+    pop di
+    call fs_save_dir
+    cmp byte [fs_ok], 1
+    jne .rn_err
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_GREEN
+    mov si, str_rename_ok
+    call print_at
+    call sh_newline
+    ret
+.rn_usage:
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_YELLOW
+    mov si, str_rename_usage
+    call print_at
+    call sh_newline
+    ret
+.rn_nf:
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_RED
+    mov si, str_fs_nf
+    call print_at
+    call sh_newline
+    ret
+.rn_err:
+    mov dh, [sh_row]
+    mov dl, 0
+    mov bl, COL_RED
+    mov si, str_fs_err
+    call print_at
+    call sh_newline
+    ret
+
+; ============================================================
+; CMD: motd - cute banner
+; ============================================================
+cmd_motd:
+    call sh_newline
+    mov si, str_motd
+    mov bl, COL_MAGENTA
+    call sh_print_multiline
+    call sh_newline
+    ret
+
+; ============================================================
+; DATA
+; ============================================================
+boot_drive      db 0
+
+; Config (persisted to LBA 64 on the boot drive)
+cfg_magic       db 0            ; 0xAB = configured
+cfg_username    times 33 db 0
+cfg_pwhash      dd 0            ; FNV-1a 32-bit hash (4096 rounds, salted w/ username)
+cfg_disk_ok     db 0            ; 1 = last disk op succeeded
+
+; Hash function I/O
+hp_pw_ptr       dw 0
+hp_un_ptr       dw 0
+hp_result       dd 0
+
+; INT 13h Disk Address Packet (LBA mode)
+dap:
+                db 0x10         ; DAP size
+                db 0            ; reserved
+                dw 1            ; sector count
+                dw cfg_disk_buf ; buffer offset
+dap_buf_seg     dw 0            ; buffer segment (set to CS at boot)
+                dd 64           ; LBA low (config sector)
+                dd 0            ; LBA high
+
+; Setup buffers
+username        times 33 db 0
+password        times 33 db 0
+drive_choice    times 5  db 0
+login_buf       times 33 db 0
+
+; Drive enum
+drv_idx         db 0
+drv_cur         db 0
+drv_tmp         db '0'
+drv_row         db 14
+align 4
+drv_size_mb     dd 0
+ext_buf         times 64 db 0
+q_dl            db 0
+q_max_cyl_lo    db 0
+q_max_cyl_hi    db 0
+q_max_head      db 0
+q_spt           db 0
+
+; Shell state
+sh_row          db 6
+cmd_buf         times MAX_CMD db 0
+
+; Shell command history (ring buffer: 8 slots × 128 bytes)
+hist_enabled    db 0
+hist_count      db 0
+hist_head       db 0
+hist_view       db 0
+hist_buf        times (8 * MAX_CMD) db 0
+
+; Editor state
+ed_line         dw 0
+ed_col          dw 0
+ed_top          dw 0
+ed_lines        dw 1
+ed_tmp_row      db 0
+ed_exit_run     db 0
+ed_mode         db 0         ; 0=normal  1=kernel editor  2=Tommy's C IDE
+ed_footer_ptr   dw str_ed_keys
+ed_buf          times (MAX_ED_LINES * ED_LINE_LEN) db 0
+                times 76 db 0           ; pad so 23 sector save/load stays in-bounds
+
+; Tommy's C interpreter state
+tc_pc           dw 0
+tc_bp           dw 0
+tc_stop_flag    db 0
+tc_name_buf     times 10 db 0
+tc_str_buf      times 96 db 0
+tc_var_names    times (16*9) db 0
+tc_var_vals     times 16 dw 0
+tc_blk_stack    times (16*5) db 0
+
+; File DAP — 23 sectors at LBA 65, buffer = ed_buf
+file_dap:
+                db 0x10
+                db 0
+                dw 23
+                dw ed_buf
+file_dap_seg    dw 0
+                dd 65
+                dd 0
+
+; Kernel editor DAP — 22 sectors from LBA 1 (the running kernel)
+kedit_dap:
+                db 0x10
+                db 0
+                dw 22
+                dw ed_buf
+kedit_dap_seg   dw 0
+                dd 1
+                dd 0
+
+; Terminal scrollback ring buffer (SCRL_MAX lines × 160 bytes = 1600 bytes)
+scrl_n          dw 0           ; lines stored in ring (0..SCRL_MAX)
+scrl_head       dw 0           ; next-write index (0..SCRL_MAX-1)
+scrl_off        dw 0           ; lines scrolled back from newest
+scrl_mode       db 0           ; 0=normal  1=scroll view active
+scrl_buf        times (SCRL_MAX * SCREEN_W * 2) db 0
+; Screen save area for scroll mode (rows 5..22 = 18 rows × 160 bytes = 2880 bytes)
+scrl_save       times (18 * SCREEN_W * 2) db 0
+
+; Graphics-mode state
+gfx_x           dw 0
+gfx_y           dw 0
+gfx_dx          dw 0
+gfx_dy          dw 0
+gfx_col         db 0x0A
+clk_buf         times 9  db 0
+
+; Mouse state
+ms_ready        db 0
+ms_x            dw 160
+ms_y            dw 100
+ms_btn          db 0
+ms_pkt          times 3 db 0
+ms_pkt_idx      db 0
+ms_saved        db 0
+ms_saved_x      dw 0
+ms_saved_y      dw 0
+ms_bg           times 64 db 0
+ms_lbtn_prev    db 0
+ms_rbtn_prev    db 0
+
+; Mouse cursor sprite 8x8: 0=transparent, 1=black border, 2=white fill
+ms_sprite:
+    db 1,0,0,0,0,0,0,0
+    db 1,1,0,0,0,0,0,0
+    db 1,2,1,0,0,0,0,0
+    db 1,2,2,1,0,0,0,0
+    db 1,2,2,2,1,0,0,0
+    db 1,2,2,2,2,1,0,0
+    db 1,2,2,1,1,1,1,0
+    db 1,1,0,1,2,2,1,0
+
+; CPU info
+cpu_vendor      times 16 db 0
+cpu_sig         dd 0
+
+; Calc state
+calc_a          dw 0
+calc_b          dw 0
+calc_op         db 0
+
+; Snake state
+snk_body        times (SNAKE_MAX*2) db 0
+snk_len         dw 0
+snk_head        dw 0
+snk_dir         dw 0
+snk_score       dw 0
+snk_fx          db 0
+snk_fy          db 0
+snk_nx          db 0
+snk_ny          db 0
+
+; Starfield state (x.w, y.w, z.w)
+sf_stars        times (STAR_COUNT*6) db 0
+
+; Tab completion state
+tab_count       dw 0
+tab_match_ptr   dw 0
+rename_buf      times 16 db 0
+
+; ----- TommyFS state -----
+align 2
+fs_ok            db 0
+fs_used          dw 0
+fs_total_bytes   dw 0
+cat_size         dw 0
+write_size       dw 0
+arg_name         times 32 db 0
+clk_row          db 0
+align 2
+fs_disk_buf      times 512 db 0
+fs_dir_buf       times 512 db 0
+
+; FS DAP (separate from the cfg dap so we don't clobber state)
+fs_dap:
+                 db 0x10
+                 db 0
+fs_dap_count     dw 1
+fs_dap_off       dw 0
+fs_dap_seg       dw 0
+fs_dap_lba       dd 0
+                 dd 0
+
+; ----- Tic-tac-toe state -----
+ttt_cells        times 9 db ' '
+ttt_turn         db 'X'
+
+; Sysinfo / cpuid / calc strings
+str_si_hdr      db '  === System Information ===', 0
+str_si_ram      db '  Conventional RAM:', 0
+str_si_kb       db ' KB', 0
+str_si_eq       db '  Equipment flags:', 0
+str_si_drv      db '  Boot drive:', 0
+str_si_vid      db '  Video mode:', 0
+
+str_cp_hdr      db '  === CPU Information ===', 0
+str_cp_vendor   db '  Vendor:', 0
+str_cp_sig      db '  Sig:', 0
+
+str_calc_badop  db '  unknown operator. use + - * /', 0
+str_calc_div0   db '  divide by zero', 0
+str_calc_eq     db '  = ', 0
+
+; Snake strings
+snk_title       db 'TOMMY SNAKE'                       ; cx=16 (padding)
+                db '     '
+snk_hint        db 'Arrows=move  ESC=quit'             ; cx=28 padded
+                db '       '
+snk_over        db 'GAME OVER'                         ; cx=9
+snk_press       db 'press any key...'                  ; cx=18 padded
+                db '  '
+snk_scorelbl    db 'SCORE: '                           ; cx=7
+
+; Starfield strings
+sf_hint         db 'ESC = back to menu'                ; cx=18
+
+; Graphics menu 5/6 already defined above (gfx_menu5/6)
+
+; ============================================================
+; STRINGS
+; ============================================================
+str_title       db "Tommy OS v1.5  -  x86 Assembly  -  type 'help'", 0
+str_title_r     db 'gfx  edit  about', 0
+str_status      db ' Tommy OS  |  help=commands  edit=editor  gfx=graphics  about=info', 0
+
+str_welcome_big db 'Tommy OS - First Boot Setup', 0
+str_welcome_sub db 'A small x86 16-bit assembly operating system.', 0
+
+str_ask_name    db 'Your name:              ---->', 0
+str_ask_pass    db 'Choose a password:      ---->', 0
+str_pass_set    db '[ password set ]', 0
+str_ask_drive   db 'Install to drive #:     ---->', 0
+str_confirm     db 'Save settings? (Y/N): ', 0
+str_drives_hdr  db 'Detected drives (pick the one with the right size):', 0
+str_drive_line  db '  - drive ', 0
+str_drv_pre     db '  drive', 0
+str_drv_fdd     db 'floppy ', 0
+str_drv_hdd     db 'disk   ', 0
+str_drv_mb      db ' MB', 0
+str_drv_unknown db '   ?  ', 0
+
+str_install_ok  db 'Setup complete. Welcome.', 0
+str_press_enter db 'Press ENTER to continue . . .', 0
+
+str_no_wifi     db '[ standalone build - no network ]', 0
+str_welcome_back db 'Signed in as ', 0
+str_login_user  db 'Username:  ', 0
+str_login_pass  db 'Password:  ', 0
+str_wrong_pass  db 'Wrong password. Press ENTER to try again.', 0
+
+str_logo1       db '   T O M M Y   O S    v 1.5   ', 0
+str_logo2       db '    A small x86 assembly OS    ', 0
+str_logo3       db '       16-bit real mode        ', 0
+str_logo4       db '===============================', 0
+
+str_shell_greet db '  Tommy OS v1.5  -  type help for commands, Up/Down for history', 0
+str_shell_hint  db '  edit  ide  kedit  gfx  snake  ttt  -  Up/Down=history  PgUp/Dn=scroll', 0
+
+str_unknown     db '  unknown command. type help for the list.', 0
+
+str_help_title  db '=== Tommy OS Commands ===', 0
+str_help_body   db '  Tip: Up / Down arrows recall previous commands.', 0x0A
+                db '  -- Shell --', 0x0A
+                db '  help           Show this list', 0x0A
+                db '  clear / cls    Clear the screen', 0x0A
+                db '  motd           Print the welcome banner', 0x0A
+                db '  ver            OS version', 0x0A
+                db '  about          About Tommy OS', 0x0A
+                db '  echo <text>    Print text', 0x0A
+                db '  history (hist) Show command history', 0x0A
+                db '  whoami         Show your username', 0x0A
+                db '  -- File system (TommyFS) --', 0x0A
+                db '  dir            List files on disk', 0x0A
+                db '  cat <name>     Print file contents', 0x0A
+                db '  write <name>   Save editor buffer as file', 0x0A
+                db '  read <name>    Load file into editor buffer', 0x0A
+                db '  del <name>     Delete file', 0x0A
+                db '  rename <o> <n> Rename file', 0x0A
+                db '  hexdump <name> Show file as hex (first 128 bytes)', 0x0A
+                db '  df             Show disk usage', 0x0A
+                db '  fsinit         Reformat the file system', 0x0A
+                db '  -- Apps --', 0x0A
+                db '  edit           Open the text editor', 0x0A
+                db '  ide            Open Tommy C IDE (green)', 0x0A
+                db '  kedit          Kernel binary editor (red)', 0x0A
+                db '  gfx            Enter graphics mode (mouse!)', 0x0A
+                db '  snake          Play Snake', 0x0A
+                db '  ttt            Play Tic-Tac-Toe', 0x0A
+                db '  clock          Live updating clock', 0x0A
+                db '  calc a + b     Tiny calculator (+ - * /)', 0x0A
+                db '  -- System --', 0x0A
+                db '  sysinfo        RAM / equipment / video', 0x0A
+                db '  cpuid          CPU vendor + features', 0x0A
+                db '  mem            Memory map', 0x0A
+                db '  asm            Assembly info', 0x0A
+                db '  date           Show today date', 0x0A
+                db '  time           Show current time', 0x0A
+                db '  uptime         BIOS tick count', 0x0A
+                db '  random         Random number', 0x0A
+                db '  beep           PC speaker beep', 0x0A
+                db '  color          Cycle title colors', 0x0A
+                db '  reboot         Reboot the machine', 0x0A
+                db '  shutdown       Power off (ACPI)', 0x0A
+                db '  -- Tommy C --', 0x0A
+                db "  manual         Tommy's C language manual", 0x0A
+                db "  run / tc       Run the editor buffer as Tommy's C", 0x0A
+                db '  save / load    Quick save/load editor buffer', 0x0A, 0
+
+str_ver         db '  Tommy OS v1.5 - x86 16-bit real mode - NASM - written from scratch', 0
+str_about       db '  ----------------------------------------', 0x0A
+                db '   Tommy OS              version 1.5', 0x0A
+                db '   Kernel:  TommyOS 0.2  (x86 real mode)', 0x0A
+                db '   Build:   NASM / BIOS / 1.44MB floppy', 0x0A
+                db '  ----------------------------------------', 0x0A
+                db '   Jesus is king.', 0
+str_ls          db '  tommy_os.asm   kernel.asm   boot.asm   shell.asm', 0x0A
+                db '  graphics.asm   editor.asm   readme.txt   bible.txt', 0
+str_asm         db '  Tommy OS runs in x86 16-bit real mode.', 0x0A
+                db '  Write assembly with edit. NASM syntax. Uses BIOS interrupts.', 0
+str_mem         db '  0x00000-0x9FFFF  Conventional RAM (640 KB)', 0x0A
+                db '  0xA0000-0xBFFFF  VGA memory', 0x0A
+                db '  0x08000          Kernel base address', 0x0A
+                db '  0x0FFFE          Stack pointer top', 0
+
+str_date_l      db '  Date (Y-M-D): ', 0
+str_time_l      db '  Time (H:M:S): ', 0
+str_uptime_l    db '  Ticks since midnight: ', 0
+str_random_l    db '  Random: ', 0
+str_beep_l      db '  *beep*', 0
+str_color_l     db '  Title color cycled.', 0
+
+str_ed_title    db ' Tommy OS Editor v1.5  -  ^S=save  ^L=load  ^R=run  ESC=quit', 0
+str_ed_keys     db ' ESC:quit  Arrows:nav  Enter:newline  Home/End:edges  ^S/L/R:save/load/run', 0
+str_ed_saved    db ' saved to disk', 0
+str_ed_loaded   db ' loaded from disk', 0
+
+; Kernel editor strings
+str_kd_title    db " Kernel Binary Editor  -  ^S=scratch  ^W=write-to-kernel!  ESC=quit", 0
+str_kd_keys     db " ESC:quit  Arrows:nav  ^S=save-scratch  ^W=WRITE-KERNEL(dangerous!)  ^L=load", 0
+str_kern_warn   db " Write ed_buf to kernel sectors? THIS OVERWRITES THE OS! (Y/N) ", 0
+str_kern_saved  db " kernel sectors written.", 0
+str_kern_save_err db " kernel write FAILED (disk error).", 0
+str_kern_load_err db "  kernel load failed (disk error).", 0
+
+; Tommy's C IDE strings
+str_ide_title   db " Tommy's C IDE v1.5  -  ^S=save  ^L=load  ^R=run  ESC=quit", 0
+str_ide_keys    db " say ask let add take times divide if repeat end stop  |  ^S/L/R=save/load/run", 0
+
+; Scroll hint
+str_scrl_hint   db " SCROLL MODE  -  PgUp=back  PgDn=forward  (any key = resume typing)", 0
+
+; Graphics-mode menu strings  (byte counts must match cx values)
+gfx_title       db 'TOMMY OS  GRAPHICS MODE'            ; cx=23
+gfx_subtitle    db '320 x 200  -  256 colors'           ; cx=24
+gfx_menu1       db '1  PAINT      mouse / arrows'       ; cx=28
+gfx_menu2       db '2  BALL       bouncing demo'        ; cx=27
+gfx_menu3       db '3  PALETTE    256 colors'           ; cx=24
+gfx_menu4       db '4  CLOCK      live BIOS time'       ; cx=28
+gfx_menu5       db '5  SNAKE      classic game'         ; cx=27
+gfx_menu6       db '6  STARS      starfield demo'       ; cx=28
+gfx_esc         db 'ESC = shell    click or 1-6'        ; cx=27
+gfx_paint_hint  db 'arrows=draw  c=clear  ESC=back'     ; cx=30
+gfx_ball_hint   db 'ESC=back to menu'                   ; cx=16
+gfx_pal_hint    db 'ESC=back to menu'                   ; cx=16
+gfx_clk_label   db 'TIME:'                              ; cx=5
+gfx_clk_hint    db 'ESC=back to menu'                   ; cx=16
+
+; Command tokens
+s_help          db 'help', 0
+s_clear         db 'clear', 0
+s_cls           db 'cls', 0
+s_ver           db 'ver', 0
+s_about         db 'about', 0
+s_whoami        db 'whoami', 0
+s_echo          db 'echo', 0
+s_ls            db 'ls', 0
+s_edit          db 'edit', 0
+s_asm           db 'asm', 0
+s_mem           db 'mem', 0
+s_gfx           db 'gfx', 0
+s_graphics      db 'graphics', 0
+s_date          db 'date', 0
+s_time          db 'time', 0
+s_uptime        db 'uptime', 0
+s_random        db 'random', 0
+s_beep          db 'beep', 0
+s_color         db 'color', 0
+s_sysinfo       db 'sysinfo', 0
+s_cpuid         db 'cpuid', 0
+s_calc          db 'calc', 0
+s_snake         db 'snake', 0
+s_reboot        db 'reboot', 0
+s_shutdown      db 'shutdown', 0
+s_run           db 'run', 0
+s_tc            db 'tc', 0
+s_manual        db 'manual', 0
+s_save          db 'save', 0
+s_load          db 'load', 0
+
+; ----- New v1.3 command tokens -----
+s_dir           db 'dir', 0
+s_cat           db 'cat', 0
+s_del           db 'del', 0
+s_write         db 'write', 0
+s_read          db 'read', 0
+s_df            db 'df', 0
+s_fsinit        db 'fsinit', 0
+s_hist          db 'history', 0
+s_hist2         db 'hist', 0
+s_clock         db 'clock', 0
+s_hex           db 'hexdump', 0
+s_ttt           db 'ttt', 0
+s_tictactoe     db 'tictactoe', 0
+s_motd          db 'motd', 0
+s_rename        db 'rename', 0
+
+; ----- New v1.5 command tokens -----
+s_kedit         db 'kedit', 0
+s_ide           db 'ide', 0
+
+; Tommy's C keywords
+tc_kw_say       db 'say', 0
+tc_kw_ask       db 'ask', 0
+tc_kw_let       db 'let', 0
+tc_kw_add       db 'add', 0
+tc_kw_take      db 'take', 0
+tc_kw_times     db 'times', 0
+tc_kw_divide    db 'divide', 0
+tc_kw_modulo    db 'modulo', 0
+tc_kw_if        db 'if', 0
+tc_kw_repeat    db 'repeat', 0
+tc_kw_end       db 'end', 0
+tc_kw_stop      db 'stop', 0
+tc_kw_be        db 'be', 0
+tc_kw_to        db 'to', 0
+tc_kw_from      db 'from', 0
+tc_kw_by        db 'by', 0
+tc_kw_is        db 'is', 0
+tc_kw_not       db 'not', 0
+
+str_tc_hdr      db "  Tommy's C  -  running your program  (any key when done)", 0
+str_tc_done     db '  -- program done -- press any key --', 0
+str_tc_err      db '  ? I do not understand that line', 0
+str_tc_prompt   db '  ? ', 0
+str_tc_save_ok  db '  saved to disk.', 0
+str_tc_save_err db '  save failed (no writable disk?).', 0
+str_tc_load_ok  db '  loaded from disk.', 0
+str_tc_load_err db '  load failed (no saved program?).', 0
+
+str_manual      db "  === Tommy's C  -  Language Manual ===", 0x0A
+                db '  Tommy C reads like English. One statement per line.', 0x0A
+                db ' ', 0x0A
+                db '  ---- Quick start ----', 0x0A
+                db '    edit       open the editor and write your program', 0x0A
+                db '    Ctrl-S     save your program (from inside the editor)', 0x0A
+                db '    Ctrl-L     load your last saved program', 0x0A
+                db '    Ctrl-R     save and run -- skips going back to shell', 0x0A
+                db '    ESC        leave the editor (returns to shell)', 0x0A
+                db ' ', 0x0A
+                db '  ---- Shell commands ----', 0x0A
+                db '    edit       open the editor', 0x0A
+                db '    run / tc   run the editor buffer right now', 0x0A
+                db '    save       save the editor buffer to disk', 0x0A
+                db '    load       load the saved buffer from disk', 0x0A
+                db '    write foo  save buffer as named file "foo" (TommyFS)', 0x0A
+                db '    read  foo  load named file "foo" into the buffer', 0x0A
+                db '    dir        list saved files', 0x0A
+                db '    manual     show this page again', 0x0A
+                db ' ', 0x0A
+                db '  ---- Statements ----', 0x0A
+                db '    say "hello"        print text (use \" for a quote)', 0x0A
+                db '    say x              print a variable as a number', 0x0A
+                db '    ask x              read a number from the user', 0x0A
+                db '    let x be 5         create or set a variable', 0x0A
+                db '    let y be x         copy one variable to another', 0x0A
+                db '    add 3 to x         x = x + 3   (also: add y to x)', 0x0A
+                db '    take 2 from x      x = x - 2', 0x0A
+                db '    times 4 by x       x = x * 4', 0x0A
+                db '    divide 4 by x      x = x / 4', 0x0A
+                db '    modulo 4 by x      x = x mod 4', 0x0A
+                db '    if x is 5          start a block if x equals 5', 0x0A
+                db '    if x is not 0      start a block if x is not 0', 0x0A
+                db '    repeat 5           run the block 5 times', 0x0A
+                db '    repeat n           variables work here too', 0x0A
+                db '    end                close an if or repeat block', 0x0A
+                db '    stop               stop the program', 0x0A
+                db '    ; a note           a comment line (ignored)', 0x0A
+                db ' ', 0x0A
+                db '  ---- Rules ----', 0x0A
+                db '    - Variable names are letters only (x, age, total).', 0x0A
+                db '    - Numbers fit in 16 bits (0 to 65535 unsigned).', 0x0A
+                db '    - Anywhere you can write a number you can use a', 0x0A
+                db '      variable instead.', 0x0A
+                db '    - Indentation is for you, not the computer.', 0x0A
+                db ' ', 0x0A
+                db '  ---- Example: countdown ----', 0x0A
+                db '    let n be 5', 0x0A
+                db '    repeat n', 0x0A
+                db '      say n', 0x0A
+                db '      take 1 from n', 0x0A
+                db '    end', 0x0A
+                db '    say "blast off!"', 0x0A
+                db '    stop', 0x0A
+                db ' ', 0x0A
+                db '  ---- Example: guess my number ----', 0x0A
+                db '    let secret be 7', 0x0A
+                db '    say "guess a number:"', 0x0A
+                db '    ask guess', 0x0A
+                db '    if guess is secret', 0x0A
+                db '      say "right!"', 0x0A
+                db '    end', 0x0A
+                db '    if guess is not secret', 0x0A
+                db '      say "nope, it was:"', 0x0A
+                db '      say secret', 0x0A
+                db '    end', 0x0A
+                db '    stop', 0
+
+; ----- TommyFS / new-command strings -----
+str_fs_err       db '  filesystem error.', 0
+str_fs_nf        db '  file not found.', 0
+str_fs_full      db '  filesystem full (16 files max).', 0
+str_fs_init_q    db '  Format filesystem? all files lost (Y/N) ', 0
+str_fs_cancel    db '  cancelled.', 0
+str_fs_formatted db '  filesystem formatted.', 0
+
+str_dir_hdr      db '  === Files on disk ===', 0
+str_dir_empty    db '  (no files)', 0
+str_dir_used     db '  Used:', 0
+str_dir_of       db ' of ', 0
+str_dir_files    db ' slots used', 0
+str_dir_bytes    db ' bytes', 0
+
+str_cat_usage    db '  usage: cat <name>', 0
+str_cat_empty    db '  (file is empty)', 0
+str_del_usage    db '  usage: del <name>', 0
+str_del_ok       db '  deleted.', 0
+str_write_usage  db '  usage: write <name>', 0
+str_write_ok     db '  written.', 0
+str_read_usage   db '  usage: read <name>', 0
+str_read_ok      db '  loaded into editor buffer.', 0
+
+str_df_hdr       db '  === Disk usage ===', 0
+str_df_files     db '  Files used:', 0
+str_df_used      db '  Bytes used:', 0
+str_df_slot      db '  Slot size:', 0
+
+str_hex_usage    db '  usage: hexdump <name>', 0
+str_rename_ok    db '  renamed.', 0
+str_rename_usage db '  usage: rename <old> <new>', 0
+
+str_hist_hdr     db '  === Command history ===', 0
+str_hist_empty   db '  (no commands yet)', 0
+
+str_clock_hint   db '  live clock (press ESC to exit)', 0
+
+str_ttt_hdr      db '  === Tic Tac Toe === (you are X, type 1-9 or ESC)', 0
+str_ttt_sep      db '  --+---+--', 0
+str_ttt_prompt   db '  your move? ', 0
+str_ttt_won      db '  YOU WIN!  praise Jesus.', 0
+str_ttt_lost     db '  you lost! the computer wins.', 0
+str_ttt_draw     db '  draw game!', 0
+
+str_motd         db '   _____                                ___  ____', 0x0A
+                 db '  |_   _|__  _ __ ___  _ __ ___  _   _ / _ \/ ___|', 0x0A
+                 db '    | |/ _ \| `_ ` _ \| `_ ` _ \| | | | | | \___ \', 0x0A
+                 db '    | | (_) | | | | | | | | | | | |_| | |_| |___) |', 0x0A
+                 db '    |_|\___/|_| |_| |_|_| |_| |_|\__, |\___/|____/', 0x0A
+                 db '                                 |___/', 0x0A
+                 db '   Tommy OS  v1.5  - your own little x86 world.', 0
+
+; Tab completion command list (alphabetical, double-null terminated)
+tab_list:
+    db 'about',0
+    db 'asm',0
+    db 'beep',0
+    db 'calc',0
+    db 'cat',0
+    db 'clear',0
+    db 'cls',0
+    db 'clock',0
+    db 'color',0
+    db 'cpuid',0
+    db 'date',0
+    db 'df',0
+    db 'del',0
+    db 'dir',0
+    db 'echo',0
+    db 'edit',0
+    db 'fsinit',0
+    db 'gfx',0
+    db 'ide',0
+    db 'graphics',0
+    db 'help',0
+    db 'hexdump',0
+    db 'hist',0
+    db 'history',0
+    db 'kedit',0
+    db 'load',0
+    db 'ls',0
+    db 'manual',0
+    db 'mem',0
+    db 'motd',0
+    db 'random',0
+    db 'read',0
+    db 'reboot',0
+    db 'rename',0
+    db 'run',0
+    db 'save',0
+    db 'shutdown',0
+    db 'snake',0
+    db 'sysinfo',0
+    db 'tc',0
+    db 'time',0
+    db 'tictactoe',0
+    db 'ttt',0
+    db 'uptime',0
+    db 'ver',0
+    db 'whoami',0
+    db 'write',0
+    db 0                    ; end sentinel
+
+; Mutable state for color command
+title_color     db COL_TITLE
+
+; 512-byte sector buffer for disk config persistence (LBA 64)
+align 2
+cfg_disk_buf    times 512 db 0
+
+; Pad to fill exactly 125 sectors (must match boot.asm)
+times (125*512)-($-$$) db 0
