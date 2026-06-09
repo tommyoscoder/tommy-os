@@ -1,6 +1,6 @@
 @echo off
 echo ============================================
-echo   Tommy OS v2.0 - Build Script
+echo   Tommy OS v2.01 - Build Script
 echo ============================================
 echo.
 
@@ -25,7 +25,7 @@ echo [1/4] Assembling bootloader...
 if %errorlevel% neq 0 ( echo FAILED. & pause & exit /b 1 )
 echo       boot.bin  OK  (512 bytes)
 
-echo [2/4] Assembling v2.0 kernel...
+echo [2/4] Assembling v2.01 kernel...
 "%NASM%" -f bin src\kernel_v2.asm -o build\kernel_v2.bin
 if %errorlevel% neq 0 ( echo FAILED. & pause & exit /b 1 )
 echo       kernel_v2.bin  OK  (64000 bytes)
@@ -44,7 +44,7 @@ echo       tommy_os_v2.iso  OK
 
 echo.
 echo ============================================
-echo   BUILD v2.0 SUCCESSFUL
+echo   BUILD v2.01 SUCCESSFUL
 echo ============================================
 echo.
 echo   Run:  run_v2.bat

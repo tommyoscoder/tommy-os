@@ -1,8 +1,8 @@
 # =====================================================================
-# Tommy OS - PowerShell USB / disk installer
+# Tommy OS v2.01 - PowerShell USB / disk installer
 #
 # Lists physical drives via CIM (modern, replaces WMIC), asks for a
-# selection, requires the user to type YES, then writes tommy_os.img
+# selection, requires the user to type YES, then writes tommy_os_v2.img
 # straight to the physical drive using a FileStream.
 #
 # Run as Administrator! Otherwise opening \\.\PhysicalDriveN will fail
@@ -32,15 +32,15 @@ function Format-Size([uint64]$bytes) {
 
 Require-Admin
 
-$imgPath = Join-Path $PSScriptRoot "build\tommy_os.img"
+$imgPath = Join-Path $PSScriptRoot "build\tommy_os_v2.img"
 if (-not (Test-Path $imgPath)) {
-    Write-Host "[ERROR] $imgPath not found. Run build.bat first." -ForegroundColor Red
+    Write-Host "[ERROR] $imgPath not found. Run build_v2.bat first." -ForegroundColor Red
     Read-Host "Press ENTER to exit"
     exit 1
 }
 
 Write-Host ""
-Write-Host "=== Tommy OS installer ===" -ForegroundColor Cyan
+Write-Host "=== Tommy OS v2.01 installer ===" -ForegroundColor Cyan
 Write-Host "Image: $imgPath"
 Write-Host ""
 Write-Host "Detected physical drives:" -ForegroundColor Cyan
@@ -95,7 +95,7 @@ if ($target.Index -eq 0) {
     exit 1
 }
 
-$confirm = Read-Host "Type YES (uppercase) to ERASE this drive and install Tommy OS"
+$confirm = Read-Host "Type YES (uppercase) to ERASE this drive and install Tommy OS v2.01"
 if ($confirm -cne "YES") {
     Write-Host "Cancelled." -ForegroundColor Cyan
     exit 0

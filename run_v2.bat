@@ -1,6 +1,6 @@
 @echo off
 echo ============================================
-echo   Tommy OS v2.0 - Launch
+echo   Tommy OS v2.01 - Launch
 echo ============================================
 echo.
 
@@ -32,7 +32,7 @@ if "%QEMU%"=="" (
 )
 
 echo QEMU: %QEMU%
-echo Image: build\tommy_os_v2.img  (Tommy OS v2.0)
+echo Image: build\tommy_os_v2.img  (Tommy OS v2.01)
 echo.
 echo  Ctrl+Alt+G   = release mouse
 echo  Ctrl+Alt+F   = toggle fullscreen
@@ -51,4 +51,4 @@ if not "%~1"=="" set "MODE_FLAG="
     -no-reboot ^
     -vga std ^
     %MODE_FLAG% ^
-    -name "Tommy OS v2.0"
+    -name "Tommy OS v2.01"

@@ -1,14 +1,14 @@
 @echo off
 setlocal
 echo ==================================================
-echo   Tommy OS v1.5  -  Install to physical drive
+echo   Tommy OS v2.01  -  Install to physical drive
 echo   !! WARNING: this ERASES the chosen drive !!
 echo ==================================================
 echo.
 
-if not exist build\tommy_os.img (
-    echo [ERROR] build\tommy_os.img not found.
-    echo         Run build.bat first.
+if not exist build\tommy_os_v2.img (
+    echo [ERROR] build\tommy_os_v2.img not found.
+    echo         Run build_v2.bat first.
     pause
     exit /b 1
 )

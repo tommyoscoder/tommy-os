@@ -69,7 +69,7 @@ $dc32 = Get-DChars 'TOMMYOS' 32
 $dc128 = Get-DChars 'TOMMYOS' 128
 [Array]::Copy($dc128,0,$pvd,190,128); [Array]::Copy($dc128,0,$pvd,318,128)
 [Array]::Copy($dc128,0,$pvd,446,128); [Array]::Copy($dc128,0,$pvd,574,128)
-$d = $enc.GetBytes('20260109000000')
+$d = $enc.GetBytes('20260609000000')
 [Array]::Copy($d,0,$pvd,813,14); $pvd[827]=0
 [Array]::Copy($d,0,$pvd,830,14); $pvd[844]=0
 $pvd[881]=1
