@@ -4,7 +4,6 @@ A small x86 16-bit operating system written entirely in assembly (NASM). Boots f
 
 ![Shell](screenshots/shell.png)
 ![First Boot Setup](screenshots/first_boot.png)
-![Running on real hardware](screenshots/real_hardware.jpg)
 
 ## Features
 
