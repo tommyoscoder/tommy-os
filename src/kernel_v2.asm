@@ -4549,8 +4549,12 @@ mouse_poll:
     mov [ms_pkt_idx], bl
     jmp .l
 .kbd:
-    ; Don't consume keyboard data here; leave it for int 16h
-    jmp .done
+    ; Drain the keyboard byte from the PS/2 hardware output buffer.
+    ; BIOS IRQ 1 already copied it into the BIOS key ring, so reading
+    ; 0x60 here doesn't lose the keystroke — it just unblocks the
+    ; single-byte PS/2 output register so mouse packets can flow again.
+    in al, 0x60
+    jmp .l          ; loop: check for more pending data
 .done:
     pop bx
     pop ax
@@ -9039,12 +9043,18 @@ gfx_topbar:
     ret
 
 ; --- gfx_desk_clk: read RTC and write HH:MM:SS at row 0 col 16 ---
+; Throttled: only redraws when the seconds digit changes (~1 Hz).
+; On a fast polling loop this drops ~26 BIOS calls/frame to 0.
 gfx_desk_clk:
     pusha
     push es
     mov ah, 0x02
     int 0x1A
-    jc .gdc_na
+    jc .gdc_na              ; RTC unavailable → force redraw
+    ; Compare current seconds (DH, BCD) to last-drawn seconds.
+    cmp dh, [gd_last_sec]
+    je .gdc_skip            ; same second → nothing to do
+    mov [gd_last_sec], dh   ; record new second
     push cx
     push dx
     mov al, ch
@@ -9068,6 +9078,8 @@ gfx_desk_clk:
     pop cx
     jmp .gdc_wr
 .gdc_na:
+    ; RTC call failed: always redraw with "--:--:--" so the
+    ; carry path never feeds a stale DH into [gd_last_sec].
     push es
     push ds
     pop es
@@ -9107,6 +9119,11 @@ gfx_desk_clk:
     int 0x10
     mov si, clk_buf2
     call gd_wstr
+    popa
+    ret
+.gdc_skip:
+    ; Second unchanged – skip all pixel writes and BIOS calls.
+    pop es
     popa
     ret
 
@@ -9582,6 +9599,9 @@ gd_str_spot     db '  Run command (Enter=exec  ESC=cancel)', 0
 gd_sbuf         times 40 db 0
 gd_slen         dw 0
 gd_scol         db 0
+
+; ---- Clock throttle: last drawn second (0xFF = never drawn) ----
+gd_last_sec     db 0xFF
 
 ; Pad to fill exactly 125 sectors (must match boot.asm)
 times (125*512)-($-$$) db 0

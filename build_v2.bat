@@ -20,17 +20,17 @@ if "%NASM%"=="" (
 
 if not exist build mkdir build
 
-echo [1/4] Assembling bootloader...
+echo [1/5] Assembling bootloader...
 "%NASM%" -f bin src\boot.asm -o build\boot.bin
 if %errorlevel% neq 0 ( echo FAILED. & pause & exit /b 1 )
 echo       boot.bin  OK  (512 bytes)
 
-echo [2/4] Assembling v2.01 kernel...
+echo [2/5] Assembling v2.01 kernel...
 "%NASM%" -f bin src\kernel_v2.asm -o build\kernel_v2.bin
 if %errorlevel% neq 0 ( echo FAILED. & pause & exit /b 1 )
 echo       kernel_v2.bin  OK  (64000 bytes)
 
-echo [3/4] Linking...
+echo [3/5] Linking...
 copy /b build\boot.bin + build\kernel_v2.bin build\tommy_os_v2.img >nul
 echo       Merged to tommy_os_v2.img
 

@@ -34,9 +34,11 @@ if "%QEMU%"=="" (
 echo QEMU: %QEMU%
 echo Image: build\tommy_os_v2.img  (Tommy OS v2.01)
 echo.
-echo  Ctrl+Alt+G   = release mouse
+echo  Ctrl+Alt+G   = release mouse (windowed mode)
 echo  Ctrl+Alt+F   = toggle fullscreen
 echo  Ctrl+Alt+Q   = quit QEMU
+echo.
+echo  Mouse is grabbed automatically on hover (windowed) or on launch (fullscreen).
 echo.
 echo Pass any arg (e.g.  run_v2.bat w  ) to start windowed.
 echo.
