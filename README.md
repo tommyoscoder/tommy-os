@@ -1,5 +1,5 @@
 
-# Tommy OS v1.5
+# Tommy OS v1.5,2.0 (Beta),2.01 (Beta) 
 
 A small x86 16-bit operating system written entirely in assembly (NASM). Boots from a 1.44 MB floppy image or El Torito ISO. Fits in 64 KB.
 
