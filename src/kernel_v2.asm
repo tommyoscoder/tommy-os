@@ -8443,102 +8443,14 @@ cfg_disk_buf    times 512 db 0
 ; ============================================================
 desktop_main:
     mov byte [desk_state], DS_DESKTOP
-    call desktop_draw_full
-
-.dm_loop:
-    ; Refresh clock on every iteration
-    call draw_titlebar
-
-    ; Non-blocking check for keypress
-    mov ah, 0x01
-    int 0x16
-    jz .dm_loop             ; no key — spin
-
-    ; Consume key
-    mov ah, 0x00
-    int 0x16
-    ; AH = scan code, AL = ASCII
-
-    ; ---- Dock shortcuts (number row) ----
-    cmp al, '1'
-    je .open_terminal
-    cmp al, 't'
-    je .open_terminal
-    cmp al, 'T'
-    je .open_terminal
-
-    cmp al, '2'
-    je .open_editor
-    cmp al, 'e'
-    je .open_editor
-    cmp al, 'E'
-    je .open_editor
-
-    cmp al, '3'
-    je .open_gfx
-    cmp al, 'g'
-    je .open_gfx
-    cmp al, 'G'
-    je .open_gfx
-
-    cmp al, '4'
-    je .open_games
-    cmp al, 's'
-    je .open_games
-    cmp al, 'S'
-    je .open_games
-
-    cmp al, '5'
-    je .open_about
-    cmp al, 'a'
-    je .open_about
-    cmp al, 'A'
-    je .open_about
-
-    jmp .dm_loop
-
-.open_terminal:
-    call shell_main
-    ; When shell exits (reboot/shutdown command), fall through to halt
-    jmp .dm_back
-
-.open_editor:
-    mov byte [desk_state], DS_EDITOR
-    call clrscr
-    call draw_titlebar
-    call draw_win_titlebar_editor
-    call draw_statusbar
-    call text_editor
-    jmp .dm_back
-
-.open_gfx:
-    call graphics_mode
-    jmp .dm_back
-
-.open_games:
-    call gfx_app_snake_entry
-    jmp .dm_back
-
-.open_about:
-    mov byte [desk_state], DS_ABOUT
-    call desktop_show_about
-    jmp .dm_back
-
-.dm_back:
-    mov byte [desk_state], DS_DESKTOP
-    call desktop_draw_full
-    jmp .dm_loop
+    call gfx_desktop_main
+    ; gfx_desktop_main loops forever; falls through only on system halt
+    ret
 
 ; ============================================================
 ; DESKTOP DRAW FULL — redraws entire desktop chrome + wallpaper
 ; ============================================================
 desktop_draw_full:
-    call clrscr
-    call draw_titlebar          ; menu bar row 0
-    call draw_desktop_bg        ; wallpaper rows 1-22
-    call draw_desktop_icons     ; desktop icons
-    call draw_desktop_hint      ; hint text
-    call draw_statusbar         ; dock row 23
     ret
 
 ; ============================================================
@@ -8569,72 +8481,12 @@ draw_desktop_bg:
 ; DESKTOP ICONS (upper-right corner, macOS Finder style)
 ; ============================================================
 draw_desktop_icons:
-    ; "Macintosh HD" style drive icon (top-right)
-    mov dh, 3
-    mov dl, 71
-    mov bl, COL_DESK_TXT
-    mov si, str_icon_hd
-    call print_at
-
-    mov dh, 4
-    mov dl, 71
-    mov bl, 0x17
-    mov si, str_icon_hd_lbl
-    call print_at
-
-    ; Trash can (bottom-right)
-    mov dh, 19
-    mov dl, 71
-    mov bl, COL_DESK_TXT
-    mov si, str_icon_trash
-    call print_at
-
-    mov dh, 20
-    mov dl, 72
-    mov bl, 0x17
-    mov si, str_icon_trash_lbl
-    call print_at
     ret
 
 ; ============================================================
 ; DESKTOP HINT — centre-screen prompt
 ; ============================================================
 draw_desktop_hint:
-    mov dh, 9
-    mov dl, 16
-    mov bl, 0x1F
-    mov si, str_desk_title
-    call print_at
-
-    mov dh, 11
-    mov dl, 12
-    mov bl, 0x17
-    mov si, str_desk_hint1
-    call print_at
-
-    mov dh, 12
-    mov dl, 12
-    mov bl, 0x17
-    mov si, str_desk_hint2
-    call print_at
-
-    mov dh, 13
-    mov dl, 12
-    mov bl, 0x17
-    mov si, str_desk_hint3
-    call print_at
-
-    mov dh, 14
-    mov dl, 12
-    mov bl, 0x17
-    mov si, str_desk_hint4
-    call print_at
-
-    mov dh, 15
-    mov dl, 12
-    mov bl, 0x17
-    mov si, str_desk_hint5
-    call print_at
     ret
 
 ; ============================================================
@@ -8866,6 +8718,786 @@ desktop_show_about:
     ret
 
 ; ============================================================
+; GRAPHICAL DESKTOP  —  VGA mode 13h  320x200  256-colour
+; ============================================================
+; Palette indices 16-31 are reprogrammed by gfx_desk_pal
+GC_BGEDGE  equ 16
+GC_BGC     equ 23
+GC_TOPBAR  equ 24
+GC_DOCKBG  equ 25
+GC_DOCKBD  equ 26
+GC_ICON    equ 27
+GC_SPOTBG  equ 29
+GC_SPOTTX  equ 30
+
+; ----------------------------------------------------------
+gfx_desktop_main:
+    mov ax, 0x0013
+    int 0x10
+    call mouse_init
+    call gfx_desk_pal
+    call gfx_desk_draw
+    call mouse_draw_cursor
+gfx_dsk_loop:
+    call mouse_restore_bg
+    call mouse_poll
+    call gfx_desk_clk
+    call mouse_draw_cursor
+    call gd_dock_click
+    mov ah, 0x01
+    int 0x16
+    jz gfx_dsk_loop
+    mov ah, 0x00
+    int 0x16
+    cmp al, '1'
+    je .gdt_term
+    cmp al, 't'
+    je .gdt_term
+    cmp al, 'T'
+    je .gdt_term
+    cmp al, '2'
+    je .gdt_edit
+    cmp al, 'e'
+    je .gdt_edit
+    cmp al, 'E'
+    je .gdt_edit
+    cmp al, '3'
+    je .gdt_grfx
+    cmp al, 'g'
+    je .gdt_grfx
+    cmp al, 'G'
+    je .gdt_grfx
+    cmp al, '4'
+    je .gdt_snake
+    cmp al, 's'
+    je .gdt_snake
+    cmp al, 'S'
+    je .gdt_snake
+    cmp al, '5'
+    je .gdt_about
+    cmp al, 'a'
+    je .gdt_about
+    cmp al, 'A'
+    je .gdt_about
+    cmp al, 0x1B
+    je gfx_dsk_loop
+    cmp al, 0x20
+    jae .gdt_spot
+    jmp gfx_dsk_loop
+.gdt_term:
+    call mouse_restore_bg
+    call gd_2text
+    call shell_main
+    call gd_2gfx
+    jmp gfx_dsk_loop
+.gdt_edit:
+    call mouse_restore_bg
+    call gd_2text
+    mov byte [desk_state], DS_EDITOR
+    call clrscr
+    call draw_titlebar
+    call draw_win_titlebar_editor
+    call draw_statusbar
+    call text_editor
+    call gd_2gfx
+    jmp gfx_dsk_loop
+.gdt_grfx:
+    call mouse_restore_bg
+    call gd_2text
+    call graphics_mode
+    call gd_2gfx
+    jmp gfx_dsk_loop
+.gdt_snake:
+    call mouse_restore_bg
+    call gd_2text
+    call gfx_app_snake_entry
+    call gd_2gfx
+    jmp gfx_dsk_loop
+.gdt_about:
+    call mouse_restore_bg
+    call gd_2text
+    mov byte [desk_state], DS_ABOUT
+    call desktop_show_about
+    call gd_2gfx
+    jmp gfx_dsk_loop
+.gdt_spot:
+    call mouse_restore_bg
+    call gfx_spotlight
+    call gfx_desk_draw
+    call mouse_draw_cursor
+    jmp gfx_dsk_loop
+
+; --- gd_2text: enter text mode for an app ---
+gd_2text:
+    push ax
+    push bx
+    mov ax, 0x0003
+    int 0x10
+    mov ax, 0x1003
+    xor bx, bx
+    int 0x10
+    pop bx
+    pop ax
+    ret
+
+; --- gd_2gfx: restore graphics desktop after app exits ---
+gd_2gfx:
+    push ax
+    push bx
+    mov byte [desk_state], DS_DESKTOP
+    mov ax, 0x0013
+    int 0x10
+    call gfx_desk_pal
+    call gfx_desk_draw
+    call mouse_draw_cursor
+    pop bx
+    pop ax
+    ret
+
+; --- gd_dock_click: handle left-click on dock icons ---
+gd_dock_click:
+    mov al, [ms_btn]
+    test al, 0x01
+    jz .dc_up
+    cmp byte [ms_lbtn_prev], 1
+    je .dc_held
+    mov ax, [ms_x]
+    mov bx, [ms_y]
+    cmp bx, 150
+    jl .dc_up
+    cmp bx, 192
+    jg .dc_up
+    ; Folder icon  x=66..122
+    cmp ax, 66
+    jl .dc_d
+    cmp ax, 122
+    jg .dc_d
+    mov byte [ms_lbtn_prev], 1
+    call mouse_restore_bg
+    call gd_2text
+    call shell_main
+    call gd_2gfx
+    ret
+.dc_d:
+    ; Doc icon  x=128..192
+    cmp ax, 128
+    jl .dc_g
+    cmp ax, 192
+    jg .dc_g
+    mov byte [ms_lbtn_prev], 1
+    call mouse_restore_bg
+    call gd_2text
+    mov byte [desk_state], DS_EDITOR
+    call clrscr
+    call draw_titlebar
+    call draw_win_titlebar_editor
+    call draw_statusbar
+    call text_editor
+    call gd_2gfx
+    ret
+.dc_g:
+    ; Gear icon  x=198..254
+    cmp ax, 198
+    jl .dc_up
+    cmp ax, 254
+    jg .dc_up
+    mov byte [ms_lbtn_prev], 1
+    call mouse_restore_bg
+    call gd_2text
+    mov byte [desk_state], DS_ABOUT
+    call desktop_show_about
+    call gd_2gfx
+    ret
+.dc_held:
+    mov byte [ms_lbtn_prev], 1
+    ret
+.dc_up:
+    mov byte [ms_lbtn_prev], 0
+    ret
+
+; --- gfx_desk_draw: composite all desktop layers ---
+gfx_desk_draw:
+    call gfx_grad_bg
+    call gfx_topbar
+    call gfx_dock_draw
+    ret
+
+; --- gfx_desk_pal: program DAC entries 16..31 ---
+gfx_desk_pal:
+    pusha
+    mov dx, 0x3C8
+    mov al, 16
+    out dx, al
+    inc dx
+    mov si, gd_pal_dat
+    mov cx, 16*3
+.gdp:
+    lodsb
+    out dx, al
+    loop .gdp
+    popa
+    ret
+
+; --- gfx_grad_bg: vertical gradient bright-centre, dark-edges ---
+gfx_grad_bg:
+    push es
+    push bx
+    push cx
+    push dx
+    push di
+    mov ax, 0xA000
+    mov es, ax
+    xor bx, bx
+.ggb_row:
+    cmp bx, 200
+    jge .ggb_done
+    mov ax, bx
+    sub ax, 100
+    jns .ggb_p
+    neg ax
+.ggb_p:
+    xor cx, cx
+    cmp ax, 13
+    jl .ggb_g
+    inc cx
+    cmp ax, 26
+    jl .ggb_g
+    inc cx
+    cmp ax, 39
+    jl .ggb_g
+    inc cx
+    cmp ax, 52
+    jl .ggb_g
+    inc cx
+    cmp ax, 65
+    jl .ggb_g
+    inc cx
+    cmp ax, 78
+    jl .ggb_g
+    inc cx
+    cmp ax, 91
+    jl .ggb_g
+    inc cx
+.ggb_g:
+    mov ax, 23
+    sub ax, cx
+    push bx
+    imul bx, bx, 320
+    mov di, bx
+    pop bx
+    mov ah, al
+    mov cx, 160
+    rep stosw
+    inc bx
+    jmp .ggb_row
+.ggb_done:
+    pop di
+    pop dx
+    pop cx
+    pop bx
+    pop es
+    ret
+
+; --- gfx_topbar: draw top bar area with floating labels ---
+gfx_topbar:
+    pusha
+    push es
+    mov ax, 0xA000
+    mov es, ax
+    xor di, di
+    mov bx, 15
+    mov ax, 0x1818          ; colour 24 in both bytes
+.tb_f:
+    mov cx, 160
+    rep stosw
+    dec bx
+    jnz .tb_f
+    ; Thin separator at row 15 (colour 31)
+    mov cx, 160
+    mov ax, 0x1F1F
+    rep stosw
+    pop es
+    ; Write "Tommy_OS" at row 0, col 1
+    mov ah, 0x02
+    xor bh, bh
+    xor dh, dh
+    mov dl, 1
+    int 0x10
+    mov si, gd_str_brand
+    call gd_wstr
+    ; Write "v 2.0" at row 0, col 35
+    mov ah, 0x02
+    xor bh, bh
+    xor dh, dh
+    mov dl, 35
+    int 0x10
+    mov si, gd_str_ver
+    call gd_wstr
+    ; Clock (writes itself at col 16)
+    call gfx_desk_clk
+    popa
+    ret
+
+; --- gfx_desk_clk: read RTC and write HH:MM:SS at row 0 col 16 ---
+gfx_desk_clk:
+    pusha
+    push es
+    mov ah, 0x02
+    int 0x1A
+    jc .gdc_na
+    push cx
+    push dx
+    mov al, ch
+    call mbclk_bcd
+    mov [clk_buf2+0], ah
+    mov [clk_buf2+1], al
+    mov byte [clk_buf2+2], ':'
+    pop dx
+    push dx
+    mov al, cl
+    call mbclk_bcd
+    mov [clk_buf2+3], ah
+    mov [clk_buf2+4], al
+    mov byte [clk_buf2+5], ':'
+    mov al, dh
+    call mbclk_bcd
+    mov [clk_buf2+6], ah
+    mov [clk_buf2+7], al
+    mov byte [clk_buf2+8], 0
+    pop dx
+    pop cx
+    jmp .gdc_wr
+.gdc_na:
+    push es
+    push ds
+    pop es
+    mov si, gd_str_nortc
+    mov di, clk_buf2
+    mov cx, 9
+    rep movsb
+    pop es
+.gdc_wr:
+    ; Clear the 9-char clock field with colour 24 pixels
+    ; Field: pixel x=128..199 (72px), y=0..7 (8px = 1 char row)
+    mov ax, 0xA000
+    mov es, ax
+    xor bx, bx
+.gdc_cy:
+    cmp bx, 8
+    jge .gdc_txt
+    push bx
+    imul bx, bx, 320
+    add bx, 128
+    mov di, bx
+    pop bx
+    mov al, 24
+    mov cx, 72
+.gdc_cx:
+    mov [es:di], al
+    inc di
+    loop .gdc_cx
+    inc bx
+    jmp .gdc_cy
+.gdc_txt:
+    pop es
+    mov ah, 0x02
+    xor bh, bh
+    xor dh, dh
+    mov dl, 16
+    int 0x10
+    mov si, clk_buf2
+    call gd_wstr
+    popa
+    ret
+
+; --- gd_wstr: write null-terminated string at cursor, colour GC_ICON ---
+; In mode 13h: AH=09h writes char; AH=03h gets cursor; AH=02h sets cursor.
+gd_wstr:
+    push ax
+    push bx
+    push cx
+    push dx
+.gwl:
+    lodsb
+    test al, al
+    jz .gwd
+    mov ah, 0x09
+    xor bh, bh
+    mov bl, GC_ICON
+    mov cx, 1
+    int 0x10
+    mov ah, 0x03
+    xor bh, bh
+    int 0x10
+    inc dl
+    cmp dl, 40
+    jl .gwadv
+    xor dl, dl
+    inc dh
+.gwadv:
+    mov ah, 0x02
+    xor bh, bh
+    int 0x10
+    jmp .gwl
+.gwd:
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; --- gfx_dock_draw: draw the rounded dock + 3 icons ---
+gfx_dock_draw:
+    pusha
+    ; Fill dock background  x=58,y=148,w=204,h=44
+    mov ax, 58
+    mov bx, 148
+    mov cx, 204
+    mov dx, 44
+    mov bp, GC_DOCKBG
+    call gd_fillrect
+    ; Dock outline
+    mov ax, 58
+    mov bx, 148
+    mov cx, 204
+    mov dx, 44
+    mov bp, GC_DOCKBD
+    call gfx_box
+    ; Icon: Folder  cx=94  cy=170
+    mov ax, 94
+    mov bx, 170
+    call gd_icon_folder
+    ; Icon: Document  cx=160  cy=170
+    mov ax, 160
+    mov bx, 170
+    call gd_icon_doc
+    ; Icon: Gear/Settings  cx=226  cy=170
+    mov ax, 226
+    mov bx, 170
+    call gd_icon_gear
+    popa
+    ret
+
+; --- gd_fillrect: fill rectangle  AX=x BX=y CX=w DX=h BP=colour ---
+gd_fillrect:
+    pusha
+    push es
+    mov si, 0xA000
+    mov es, si
+    mov si, ax          ; SI = left-edge x
+.gfr_r:
+    test dx, dx
+    jz .gfr_done
+    push bx
+    imul bx, bx, 320
+    add bx, si
+    mov di, bx
+    pop bx
+    push cx
+    mov ax, bp          ; AL = colour byte
+.gfr_p:
+    mov [es:di], al
+    inc di
+    dec cx
+    jnz .gfr_p
+    pop cx
+    inc bx
+    dec dx
+    jmp .gfr_r
+.gfr_done:
+    pop es
+    popa
+    ret
+
+; --- gd_icon_folder: draw folder icon centred at AX=cx BX=cy ---
+gd_icon_folder:
+    pusha
+    mov si, ax
+    mov di, bx
+    ; Tab: 16x6 at (cx-16, cy-14), colour 28 (warm highlight)
+    mov ax, si
+    sub ax, 16
+    mov bx, di
+    sub bx, 14
+    mov cx, 16
+    mov dx, 6
+    mov bp, 28
+    call gd_fillrect
+    ; Body: 34x24 at (cx-17, cy-7), colour 27
+    mov ax, si
+    sub ax, 17
+    mov bx, di
+    sub bx, 7
+    mov cx, 34
+    mov dx, 24
+    mov bp, GC_ICON
+    call gd_fillrect
+    popa
+    ret
+
+; --- gd_icon_doc: draw document icon centred at AX=cx BX=cy ---
+gd_icon_doc:
+    pusha
+    mov si, ax
+    mov di, bx
+    ; Full page: 26x32 at (cx-13, cy-16)
+    mov ax, si
+    sub ax, 13
+    mov bx, di
+    sub bx, 16
+    mov cx, 26
+    mov dx, 32
+    mov bp, GC_ICON
+    call gd_fillrect
+    ; Folded corner (top-right 7x7): paint over with dock bg
+    mov ax, si
+    add ax, 6
+    mov bx, di
+    sub bx, 16
+    mov cx, 7
+    mov dx, 7
+    mov bp, GC_DOCKBG
+    call gd_fillrect
+    ; Three "text" lines cut into page (dock bg = dark strips)
+    ; Line 1
+    mov ax, si
+    sub ax, 8
+    mov bx, di
+    sub bx, 7
+    mov cx, 16
+    mov dx, 2
+    mov bp, GC_DOCKBG
+    call gd_fillrect
+    ; Line 2
+    mov ax, si
+    sub ax, 8
+    mov bx, di
+    sub bx, 1
+    mov cx, 16
+    mov dx, 2
+    call gd_fillrect
+    ; Line 3
+    mov ax, si
+    sub ax, 8
+    mov bx, di
+    add bx, 5
+    mov cx, 16
+    mov dx, 2
+    call gd_fillrect
+    popa
+    ret
+
+; --- gd_icon_gear: draw gear/settings icon centred at AX=cx BX=cy ---
+gd_icon_gear:
+    pusha
+    mov si, ax
+    mov di, bx
+    ; Outer body 20x20, colour 27
+    mov ax, si
+    sub ax, 10
+    mov bx, di
+    sub bx, 10
+    mov cx, 20
+    mov dx, 20
+    mov bp, GC_ICON
+    call gd_fillrect
+    ; Erase 4x4 corners to round the body
+    mov bp, GC_DOCKBG
+    mov cx, 4
+    mov dx, 4
+    mov ax, si
+    sub ax, 10
+    mov bx, di
+    sub bx, 10
+    call gd_fillrect                ; TL
+    mov ax, si
+    add ax, 6
+    mov bx, di
+    sub bx, 10
+    call gd_fillrect                ; TR
+    mov ax, si
+    sub ax, 10
+    mov bx, di
+    add bx, 6
+    call gd_fillrect                ; BL
+    mov ax, si
+    add ax, 6
+    mov bx, di
+    add bx, 6
+    call gd_fillrect                ; BR
+    ; Centre hole 8x8
+    mov ax, si
+    sub ax, 4
+    mov bx, di
+    sub bx, 4
+    mov cx, 8
+    mov dx, 8
+    call gd_fillrect
+    ; 4 teeth: N / S / W / E  (4x6 or 6x4)
+    mov bp, GC_ICON
+    ; N
+    mov ax, si
+    sub ax, 2
+    mov bx, di
+    sub bx, 16
+    mov cx, 4
+    mov dx, 6
+    call gd_fillrect
+    ; S
+    mov ax, si
+    sub ax, 2
+    mov bx, di
+    add bx, 10
+    call gd_fillrect
+    ; W
+    mov ax, si
+    sub ax, 16
+    mov bx, di
+    sub bx, 2
+    mov cx, 6
+    mov dx, 4
+    call gd_fillrect
+    ; E
+    mov ax, si
+    add ax, 10
+    mov bx, di
+    sub bx, 2
+    call gd_fillrect
+    popa
+    ret
+
+; --- gfx_spotlight: centered input overlay for running commands ---
+gfx_spotlight:
+    pusha
+    ; Draw background box  x=50,y=72,w=220,h=56
+    mov ax, 50
+    mov bx, 72
+    mov cx, 220
+    mov dx, 56
+    mov bp, GC_SPOTBG
+    call gd_fillrect
+    ; Outer border (colour 26)
+    mov ax, 50
+    mov bx, 72
+    mov cx, 220
+    mov dx, 56
+    mov bp, GC_DOCKBD
+    call gfx_box
+    ; Inner border (colour 27)
+    mov ax, 52
+    mov bx, 74
+    mov cx, 216
+    mov dx, 52
+    mov bp, GC_ICON
+    call gfx_box
+    ; Header text at row 9, col 14
+    mov ah, 0x02
+    xor bh, bh
+    mov dh, 9
+    mov dl, 14
+    int 0x10
+    mov si, gd_str_spot
+    call gd_wstr
+    ; Prompt ">" at row 10, col 7
+    mov ah, 0x02
+    xor bh, bh
+    mov dh, 10
+    mov dl, 7
+    int 0x10
+    mov ah, 0x09
+    mov al, '>'
+    xor bh, bh
+    mov bl, GC_ICON
+    mov cx, 1
+    int 0x10
+    ; Position cursor at col 9, row 10
+    mov ah, 0x02
+    xor bh, bh
+    mov dh, 10
+    mov dl, 9
+    int 0x10
+    ; Init input state
+    mov word [gd_slen], 0
+    mov byte [gd_scol], 9
+.spl:
+    xor ax, ax
+    int 0x16
+    cmp al, 0x1B
+    je .spout
+    cmp al, 0x0D
+    je .spexec
+    cmp al, 0x08
+    je .spbs
+    cmp al, 0x20
+    jl .spl
+    mov bx, [gd_slen]
+    cmp bx, 37
+    jge .spl
+    mov si, gd_sbuf
+    add si, bx
+    mov [si], al
+    inc word [gd_slen]
+    mov ah, 0x09
+    xor bh, bh
+    mov bl, GC_SPOTTX
+    mov cx, 1
+    int 0x10
+    inc byte [gd_scol]
+    mov ah, 0x02
+    xor bh, bh
+    mov dh, 10
+    mov dl, [gd_scol]
+    int 0x10
+    jmp .spl
+.spbs:
+    cmp word [gd_slen], 0
+    je .spl
+    dec word [gd_slen]
+    dec byte [gd_scol]
+    mov ah, 0x02
+    xor bh, bh
+    mov dh, 10
+    mov dl, [gd_scol]
+    int 0x10
+    mov ah, 0x09
+    mov al, ' '
+    xor bh, bh
+    mov bl, GC_SPOTBG
+    mov cx, 1
+    int 0x10
+    mov ah, 0x02
+    xor bh, bh
+    mov dh, 10
+    mov dl, [gd_scol]
+    int 0x10
+    jmp .spl
+.spexec:
+    ; Null-terminate buffer
+    mov bx, [gd_slen]
+    mov si, gd_sbuf
+    add si, bx
+    mov byte [si], 0
+    ; Copy input to cmd_buf
+    push es
+    push ds
+    pop es
+    mov si, gd_sbuf
+    mov di, cmd_buf
+    mov cx, MAX_CMD
+    rep movsb
+    pop es
+    ; Switch to text mode and run command
+    call gd_2text
+    call exec_cmd
+    ; Wait for key before returning to desktop
+    xor ax, ax
+    int 0x16
+    call gd_2gfx
+.spout:
+    popa
+    ret
+
+; ============================================================
 ; NEW STRING DATA (v2 additions)
 ; ============================================================
 
@@ -8920,6 +9552,36 @@ desk_state      db DS_DESKTOP
 
 ; Clock buffer for menu bar
 clk_buf2        times 10 db 0
+
+; ---- GFX Desktop palette data: 16 entries × (R,G,B) each 0-63 ----
+gd_pal_dat:
+    db  0, 0,18   ; 16: bg edge (very dark blue)
+    db  0, 3,26   ; 17
+    db  0, 7,34   ; 18
+    db  2,12,42   ; 19
+    db  5,18,50   ; 20
+    db  9,24,57   ; 21
+    db 13,30,63   ; 22
+    db 18,36,63   ; 23: bg centre (bright blue)
+    db  2, 2,14   ; 24: top bar (near-black)
+    db  8,10,22   ; 25: dock background
+    db 28,30,44   ; 26: dock border
+    db 52,56,63   ; 27: icon / text (near-white blue)
+    db 60,58,30   ; 28: icon tab highlight (warm)
+    db  6, 8,20   ; 29: spotlight background
+    db 55,55,62   ; 30: spotlight text
+    db 16,18,36   ; 31: top bar separator
+
+; ---- GFX Desktop strings ----
+gd_str_brand    db 'Tommy_OS', 0
+gd_str_ver      db 'v 2.01', 0
+gd_str_nortc    db '--:--:--', 0
+gd_str_spot     db '  Run command (Enter=exec  ESC=cancel)', 0
+
+; ---- GFX Spotlight input state ----
+gd_sbuf         times 40 db 0
+gd_slen         dw 0
+gd_scol         db 0
 
 ; Pad to fill exactly 125 sectors (must match boot.asm)
 times (125*512)-($-$$) db 0
