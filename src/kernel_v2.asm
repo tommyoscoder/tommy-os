@@ -8744,31 +8744,34 @@ gfx_desktop_main:
     call gfx_desk_draw
     call mouse_draw_cursor
 gfx_dsk_loop:
-    call mouse_restore_bg
-    call mouse_poll
+    call mouse_poll             ; read PS/2 – do NOT restore cursor yet
 
-    ; ongoing window drag
+    ; --- ongoing window drag ---
     cmp byte [wm_drag_wnd], 0xFF
     je .wdl_chk_rsz
     test byte [ms_btn], 0x01
     jz .wdl_end_drag
-    call wm_do_drag
+    call wm_do_drag             ; only sets dirty when pos changes
     jmp .wdl_aft
 .wdl_end_drag:
     mov byte [wm_drag_wnd], 0xFF
     mov byte [wm_dirty], 1
     jmp .wdl_aft
+
+    ; --- ongoing resize ---
 .wdl_chk_rsz:
     cmp byte [wm_rsz_wnd], 0xFF
     je .wdl_newclk
     test byte [ms_btn], 0x01
     jz .wdl_end_rsz
-    call wm_do_resize
+    call wm_do_resize           ; only sets dirty when size changes
     jmp .wdl_aft
 .wdl_end_rsz:
     mov byte [wm_rsz_wnd], 0xFF
     mov byte [wm_dirty], 1
     jmp .wdl_aft
+
+    ; --- new click ---
 .wdl_newclk:
     test byte [ms_btn], 0x01
     jz .wdl_btnup
@@ -8792,13 +8795,30 @@ gfx_dsk_loop:
     mov byte [ms_lbtn_prev], 1
 .wdl_clk:
     call gfx_desk_clk
+
+    ; --- cursor/dirty update: ONLY when something changed ---
+    mov ax, [ms_x]
+    mov bx, [ms_y]
     cmp byte [wm_dirty], 0
-    je .wdl_nd
+    jne .wdl_do_upd
+    cmp ax, [wm_last_ms_x]
+    jne .wdl_do_upd
+    cmp bx, [wm_last_ms_y]
+    je .wdl_no_upd
+.wdl_do_upd:
+    call mouse_restore_bg       ; erase cursor before any VGA write
+    mov [wm_last_ms_x], ax
+    mov [wm_last_ms_y], bx
+    cmp byte [wm_dirty], 0
+    je .wdl_skip_rd
     mov byte [wm_dirty], 0
     call gfx_desk_draw
     call wm_draw_all
-.wdl_nd:
+.wdl_skip_rd:
     call mouse_draw_cursor
+.wdl_no_upd:
+
+    ; --- keyboard ---
     mov ah, 0x01
     int 0x16
     jz gfx_dsk_loop
@@ -8815,9 +8835,7 @@ gfx_dsk_loop:
     jb gfx_dsk_loop
     call mouse_restore_bg
     call gfx_spotlight
-    call gfx_desk_draw
-    call wm_draw_all
-    call mouse_draw_cursor
+    mov byte [wm_dirty], 1
     jmp gfx_dsk_loop
 
 ; --- gd_2text: enter text mode for an app ---
@@ -8856,6 +8874,8 @@ WF_OPEN   equ 0x01
 WF_MAX    equ 0x02
 WT_FILES  equ 1
 WT_EDIT   equ 2
+WT_STORE  equ 3
+WT_CODE   equ 4
 WTB_H     equ 11
 WMW_MIN_W equ 90
 WMW_MIN_H equ 50
@@ -8877,39 +8897,44 @@ wm_dock_click:
     jl .wdc_ret
     cmp bx, 192
     jg .wdc_ret
-    ; Folder icon x=66..122 -> file manager
-    cmp ax, 66
+    ; Folder x=68..108 -> File Manager
+    cmp ax, 68
     jl .wdc_doc
-    cmp ax, 122
+    cmp ax, 108
     jg .wdc_doc
     mov al, WT_FILES
     mov ah, 0
     call wm_open_wnd
     jmp .wdc_ret
 .wdc_doc:
-    ; Doc icon x=128..192 -> text editor
-    cmp ax, 128
-    jl .wdc_gear
-    cmp ax, 192
-    jg .wdc_gear
+    ; Doc x=116..156 -> Text Editor
+    cmp ax, 116
+    jl .wdc_code
+    cmp ax, 156
+    jg .wdc_code
     mov al, WT_EDIT
     mov ah, 0xFF
     call wm_open_wnd
     jmp .wdc_ret
-.wdc_gear:
-    ; Gear x=198..254 -> about (text mode)
-    cmp ax, 198
+.wdc_code:
+    ; Code x=164..204 -> Tommy's C Editor
+    cmp ax, 164
+    jl .wdc_store
+    cmp ax, 204
+    jg .wdc_store
+    mov al, WT_CODE
+    mov ah, 0xFF
+    call wm_open_wnd
+    jmp .wdc_ret
+.wdc_store:
+    ; Store x=212..252 -> App Store
+    cmp ax, 212
     jl .wdc_ret
-    cmp ax, 254
+    cmp ax, 252
     jg .wdc_ret
-    popa
-    call mouse_restore_bg
-    call gd_2text
-    mov byte [desk_state], DS_ABOUT
-    call desktop_show_about
-    call gd_2gfx
-    mov byte [wm_dirty], 1
-    ret
+    mov al, WT_STORE
+    mov ah, 0
+    call wm_open_wnd
 .wdc_ret:
     popa
     ret
@@ -8943,7 +8968,11 @@ wm_open_wnd:
     mov [di+2], ax
     cmp cl, WT_FILES
     je .wop_files
-    ; WT_EDIT
+    cmp cl, WT_STORE
+    je .wop_store
+    cmp cl, WT_CODE
+    je .wop_code
+    ; WT_EDIT (fallthrough)
     mov word [di+4], 200
     mov word [di+6], 110
     mov word [di+18], wm_str_edit
@@ -8961,6 +8990,24 @@ wm_open_wnd:
 .wop_use_fi:
     movzx ax, ch
     mov [di+20], ax
+    jmp .wop_geom
+.wop_store:
+    mov word [di+4], 200
+    mov word [di+6], 120
+    mov word [di+18], wm_str_store
+    mov word [di+20], 0
+    jmp .wop_geom
+.wop_code:
+    mov word [di+4], 200
+    mov word [di+6], 130
+    mov word [di+18], wm_str_code
+    movzx ax, byte [wm_next_file]
+    mov [di+20], ax
+    inc byte [wm_next_file]
+    mov al, [wm_next_file]
+    cmp al, VFS_MAX
+    jb .wop_geom
+    mov byte [wm_next_file], 0
     jmp .wop_geom
 .wop_files:
     mov word [di+4], 180
@@ -9224,7 +9271,11 @@ wm_do_drag:
     jle .wdd_xfin
     mov ax, cx
 .wdd_xfin:
+    cmp ax, [di+0]
+    je .wdd_chy
     mov [di+0], ax
+    mov byte [wm_dirty], 1
+.wdd_chy:
     ; new_y = ms_y - drag_oy, clamped 15..(147-h)
     mov ax, [ms_y]
     sub ax, [wm_drag_oy]
@@ -9238,8 +9289,11 @@ wm_do_drag:
     jle .wdd_yfin
     mov ax, cx
 .wdd_yfin:
+    cmp ax, [di+2]
+    je .wdd_done
     mov [di+2], ax
     mov byte [wm_dirty], 1
+.wdd_done:
     popa
     ret
 
@@ -9263,7 +9317,11 @@ wm_do_resize:
     jle .wdr_wfin
     mov ax, cx
 .wdr_wfin:
+    cmp ax, [di+4]
+    je .wdr_chh
     mov [di+4], ax
+    mov byte [wm_dirty], 1
+.wdr_chh:
     ; new_h = ms_y - wy, clamped WMW_MIN_H..(147-wy)
     mov ax, [ms_y]
     sub ax, [di+2]
@@ -9277,8 +9335,11 @@ wm_do_resize:
     jle .wdr_hfin
     mov ax, cx
 .wdr_hfin:
+    cmp ax, [di+6]
+    je .wdr_done
     mov [di+6], ax
     mov byte [wm_dirty], 1
+.wdr_done:
     popa
     ret
 
@@ -9507,12 +9568,22 @@ wm_draw_content:
     je .wdc_files
     cmp al, WT_EDIT
     je .wdc_edit
+    cmp al, WT_STORE
+    je .wdc_store
+    cmp al, WT_CODE
+    je .wdc_code
     jmp .wdc_done
 .wdc_files:
     call fm_draw
     jmp .wdc_done
 .wdc_edit:
     call te_draw
+    jmp .wdc_done
+.wdc_store:
+    call as_draw
+    jmp .wdc_done
+.wdc_code:
+    call tc_draw
 .wdc_done:
     popa
     ret
@@ -9836,6 +9907,8 @@ te_key:
 ; --- wm_key_dispatch: AL=key, route to focused window ---
 wm_key_dispatch:
     pusha
+    mov [wm_key_tmp], al
+    mov [wm_scan_tmp], ah       ; save scan code for F-key detection
     movzx bx, byte [wm_focus_wnd]
     cmp bx, MAX_WNDS
     jae .wkd_done
@@ -9844,15 +9917,24 @@ wm_key_dispatch:
     add di, windows
     test byte [di+17], WF_OPEN
     jz .wkd_done
-    ; ESC always closes focused window
-    cmp al, 0x1B
+    cmp byte [wm_key_tmp], 0x1B
     jne .wkd_type
     call wm_close_wnd
     jmp .wkd_done
 .wkd_type:
-    ; save key in temp var, then check window type
-    mov [wm_key_tmp], al
     mov al, [di+16]
+    cmp al, WT_CODE
+    jne .wkd_not_code
+    ; F5 (scan 0x3F) runs Tommy's C; all other keys edit text
+    cmp byte [wm_scan_tmp], 0x3F
+    jne .wkd_code_key
+    call wm_tc_run
+    jmp .wkd_done
+.wkd_code_key:
+    mov al, [wm_key_tmp]
+    call te_key
+    jmp .wkd_done
+.wkd_not_code:
     cmp al, WT_EDIT
     jne .wkd_done
     mov al, [wm_key_tmp]
@@ -9862,14 +9944,60 @@ wm_key_dispatch:
     ret
 
 ; --- wm_cont_click: handle click in window content area ---
-; AH=WH_CONT, AL=wndidx, BL=wndidx, ms_x/ms_y=click pos
+; BL=wndidx, ms_x/ms_y=click pos
 wm_cont_click:
     pusha
     movzx di, bl
     imul di, di, WND_SIZE
     add di, windows
-    ; currently just set dirty to show focus change
     mov byte [wm_dirty], 1
+    cmp byte [di+16], WT_STORE
+    je .wcc_store
+    jmp .wcc_done
+.wcc_store:
+    ; row = (ms_y - (wy+WTB_H+2)) / 8
+    mov ax, [ms_y]
+    mov bx, [di+2]
+    add bx, WTB_H + 2
+    sub ax, bx
+    cmp ax, 0
+    jl .wcc_done
+    shr ax, 3
+    ; row 1=File Mgr, 2=Text Editor, 3=Snake, 4=Paint
+    cmp ax, 1
+    je .wcc_files
+    cmp ax, 2
+    je .wcc_edit
+    cmp ax, 3
+    je .wcc_snake
+    cmp ax, 4
+    je .wcc_paint
+    jmp .wcc_done
+.wcc_files:
+    mov al, WT_FILES
+    mov ah, 0
+    call wm_open_wnd
+    jmp .wcc_done
+.wcc_edit:
+    mov al, WT_EDIT
+    mov ah, 0xFF
+    call wm_open_wnd
+    jmp .wcc_done
+.wcc_snake:
+    call wm_close_wnd           ; close store window (BL still valid)
+    popa                        ; restore regs before mode switch
+    call mouse_restore_bg
+    call gfx_app_snake_entry
+    call wm_restore_desk
+    ret
+.wcc_paint:
+    call wm_close_wnd
+    popa
+    call mouse_restore_bg
+    call gfx_app_paint
+    call wm_restore_desk
+    ret
+.wcc_done:
     popa
     ret
 
@@ -9923,6 +10051,18 @@ wm_init_vfs:
 
 ; --- gd_dock_click: stub (replaced by wm_dock_click) ---
 gd_dock_click:
+    ret
+
+; --- wm_restore_desk: return to windowed desktop after a full-screen app ---
+wm_restore_desk:
+    push ax
+    push bx
+    mov ax, 0x0013
+    int 0x10
+    call gfx_desk_pal
+    mov byte [wm_dirty], 1
+    pop bx
+    pop ax
     ret
 
 ; --- gfx_desk_draw: composite all desktop layers ---
@@ -10169,35 +10309,39 @@ gd_wstr:
     pop ax
     ret
 
-; --- gfx_dock_draw: draw the rounded dock + 3 icons ---
+; --- gfx_dock_draw: draw the dock + 4 icons ---
 gfx_dock_draw:
     pusha
-    ; Fill dock background  x=58,y=148,w=204,h=44
-    mov ax, 58
+    ; Dock background  x=40,y=148,w=240,h=44
+    mov ax, 40
     mov bx, 148
-    mov cx, 204
+    mov cx, 240
     mov dx, 44
     mov bp, GC_DOCKBG
     call gd_fillrect
     ; Dock outline
-    mov ax, 58
+    mov ax, 40
     mov bx, 148
-    mov cx, 204
+    mov cx, 240
     mov dx, 44
     mov bp, GC_DOCKBD
     call gfx_box
-    ; Icon: Folder  cx=94  cy=170
-    mov ax, 94
+    ; Folder cx=88 cy=170
+    mov ax, 88
     mov bx, 170
     call gd_icon_folder
-    ; Icon: Document  cx=160  cy=170
-    mov ax, 160
+    ; Document cx=136 cy=170
+    mov ax, 136
     mov bx, 170
     call gd_icon_doc
-    ; Icon: Gear/Settings  cx=226  cy=170
-    mov ax, 226
+    ; Code editor cx=184 cy=170
+    mov ax, 184
     mov bx, 170
-    call gd_icon_gear
+    call gd_icon_code
+    ; App Store cx=232 cy=170
+    mov ax, 232
+    mov bx, 170
+    call gd_icon_store
     popa
     ret
 
@@ -10228,6 +10372,96 @@ gd_fillrect:
     dec dx
     jmp .gfr_r
 .gfr_done:
+    pop es
+    popa
+    ret
+
+; --- gd_icon_code: terminal/code icon centred at AX=cx BX=cy ---
+gd_icon_code:
+    pusha
+    push es
+    mov di, 0xA000
+    mov es, di
+    sub ax, 7           ; left edge
+    sub bx, 5           ; top edge
+    push ax
+    push bx
+    ; outer terminal box (14x10)
+    mov cx, 14
+    mov dx, 10
+    mov bp, GC_DOCKBD
+    call gfx_box
+    ; dark inner fill
+    pop bx
+    pop ax
+    push ax
+    push bx
+    inc ax
+    inc bx
+    mov cx, 12
+    mov dx, 8
+    mov bp, GC_SPOTBG
+    call gd_fillrect
+    ; three code-line bars
+    pop bx
+    pop ax
+    add ax, 2
+    add bx, 2
+    push bx
+    mov cx, 5
+    mov dx, 1
+    mov bp, GC_ICON
+    call gd_fillrect        ; bar 1 (5px)
+    pop bx
+    add bx, 3
+    push bx
+    mov cx, 8
+    call gd_fillrect        ; bar 2 (8px)
+    pop bx
+    add bx, 3
+    mov cx, 4
+    call gd_fillrect        ; bar 3 (4px)
+    pop es
+    popa
+    ret
+
+; --- gd_icon_store: shopping-bag icon centred at AX=cx BX=cy ---
+gd_icon_store:
+    pusha
+    push es
+    mov di, 0xA000
+    mov es, di
+    push ax             ; save center-x
+    push bx             ; save center-y
+    ; bag body (14x9) top-left = (cx-7, cy-1)
+    sub ax, 7
+    sub bx, 1
+    mov cx, 14
+    mov dx, 9
+    mov bp, GC_DOCKBD
+    call gfx_box        ; body outline
+    inc ax
+    inc bx
+    mov cx, 12
+    mov dx, 7
+    mov bp, GC_TOPBAR
+    call gd_fillrect    ; body fill
+    ; handle bars above bag
+    pop bx              ; center-y
+    pop ax              ; center-x
+    push ax
+    push bx
+    sub ax, 4           ; left post x
+    sub bx, 6           ; handle top y
+    mov cx, 1
+    mov dx, 5
+    mov bp, GC_DOCKBD
+    call gd_fillrect    ; left bar
+    pop bx
+    pop ax
+    add ax, 3           ; right post x
+    sub bx, 6
+    call gd_fillrect    ; right bar (cx=1 dx=5 bp still set)
     pop es
     popa
     ret
@@ -10387,6 +10621,631 @@ gd_icon_gear:
     sub bx, 2
     call gd_fillrect
     popa
+    ret
+
+; ============================================================
+; Tommy's C Interpreter  (F5 to run from the Code window)
+; Syntax: print "string" | print EXPR | var NAME = EXPR | NAME = EXPR
+; EXPR: integer | variable | EXPR +/- integer | EXPR * integer
+; ============================================================
+
+; --- wm_tc_run: interpret Tommy's C source in focused window ---
+wm_tc_run:
+    pusha
+    push es
+    push ds
+    pop es
+    mov di, tc_out_buf
+    xor al, al
+    mov cx, 96
+    rep stosb
+    mov di, tc_vars
+    mov cx, TC_VAR_SLOTS * TC_VAR_SIZE
+    rep stosb
+    pop es
+    mov word [tc_out_len], 0
+    movzx bx, byte [wm_focus_wnd]
+    cmp bx, MAX_WNDS
+    jae .tcr_show
+    movzx di, bl
+    imul di, di, WND_SIZE
+    add di, windows
+    movzx si, word [di+20]
+    cmp si, VFS_MAX
+    jae .tcr_show
+    imul si, si, VFS_BSIZ
+    add si, vfs_bufs
+.tcr_main:
+    cmp byte [si], ' '
+    jne .tcr_nsp
+    inc si
+    jmp .tcr_main
+.tcr_nsp:
+    cmp byte [si], 0
+    je .tcr_show
+    cmp byte [si], 0x0A
+    je .tcr_nl
+    cmp byte [si], '#'
+    je .tcr_skip
+    ; read first word into tc_tok
+    mov di, tc_tok
+    mov cx, 9
+.tcr_rw:
+    mov al, [si]
+    cmp al, ' '
+    jbe .tcr_rwe
+    cmp al, '='
+    je .tcr_rwe
+    mov [di], al
+    inc si
+    inc di
+    dec cx
+    jnz .tcr_rw
+.tcr_rwe:
+    mov byte [di], 0
+    mov di, tc_kw_print
+    call tc_cmpstr
+    je .tcr_print
+    mov di, tc_kw_var
+    call tc_cmpstr
+    je .tcr_var_decl
+    jmp .tcr_assign
+.tcr_print:
+.tcr_prsp:
+    cmp byte [si], ' '
+    jne .tcr_prnsp
+    inc si
+    jmp .tcr_prsp
+.tcr_prnsp:
+    cmp byte [si], '"'
+    je .tcr_prstr
+    call wm_tc_eval
+    call tc_out_newline
+    call tc_out_num
+    jmp .tcr_skip
+.tcr_prstr:
+    inc si
+    call tc_out_newline
+.tcr_prsl:
+    mov al, [si]
+    test al, al
+    jz .tcr_show
+    cmp al, '"'
+    je .tcr_prse
+    cmp al, 0x0A
+    je .tcr_skip
+    call tc_out_char
+    inc si
+    jmp .tcr_prsl
+.tcr_prse:
+    inc si
+    jmp .tcr_skip
+.tcr_var_decl:
+.tcr_vdsp:
+    cmp byte [si], ' '
+    jne .tcr_vdnsp
+    inc si
+    jmp .tcr_vdsp
+.tcr_vdnsp:
+    mov di, tc_tok
+    mov cx, 7
+.tcr_vdnm:
+    mov al, [si]
+    cmp al, ' '
+    jbe .tcr_vdnme
+    cmp al, '='
+    je .tcr_vdnme
+    mov [di], al
+    inc si
+    inc di
+    dec cx
+    jnz .tcr_vdnm
+.tcr_vdnme:
+    mov byte [di], 0
+.tcr_vdeq:
+    mov al, [si]
+    cmp al, '='
+    je .tcr_vdeqf
+    test al, al
+    jz .tcr_show
+    cmp al, 0x0A
+    je .tcr_skip
+    inc si
+    jmp .tcr_vdeq
+.tcr_vdeqf:
+    inc si
+.tcr_vdvs:
+    cmp byte [si], ' '
+    jne .tcr_vdvns
+    inc si
+    jmp .tcr_vdvs
+.tcr_vdvns:
+    call wm_tc_eval
+    call tc_store_var
+    jmp .tcr_skip
+.tcr_assign:
+.tcr_aseq:
+    mov al, [si]
+    cmp al, '='
+    je .tcr_aseqf
+    test al, al
+    jz .tcr_show
+    cmp al, 0x0A
+    je .tcr_skip
+    inc si
+    jmp .tcr_aseq
+.tcr_aseqf:
+    inc si
+.tcr_assp:
+    cmp byte [si], ' '
+    jne .tcr_asnsp
+    inc si
+    jmp .tcr_assp
+.tcr_asnsp:
+    call wm_tc_eval
+    call tc_store_var
+.tcr_skip:
+.tcr_skl:
+    mov al, [si]
+    test al, al
+    jz .tcr_show
+    cmp al, 0x0A
+    je .tcr_nl
+    inc si
+    jmp .tcr_skl
+.tcr_nl:
+    inc si
+    jmp .tcr_main
+.tcr_show:
+    call tc_show_output
+    popa
+    ret
+
+; --- wm_tc_eval: evaluate expression at [SI], advance SI, return AX ---
+wm_tc_eval:
+    push bx
+    push cx
+.tce_sp:
+    cmp byte [si], ' '
+    jne .tce_nsp
+    inc si
+    jmp .tce_sp
+.tce_nsp:
+    cmp byte [si], '0'
+    jb .tce_var
+    cmp byte [si], '9'
+    ja .tce_var
+    xor ax, ax
+.tce_dig:
+    mov cl, [si]
+    cmp cl, '0'
+    jb .tce_op
+    cmp cl, '9'
+    ja .tce_op
+    imul ax, ax, 10
+    sub cl, '0'
+    movzx cx, cl
+    add ax, cx
+    inc si
+    jmp .tce_dig
+.tce_var:
+    mov di, tc_tok2
+    mov cx, 7
+.tce_vrd:
+    mov al, [si]
+    cmp al, 'A'
+    jb .tce_vrd_done
+    cmp al, 'Z'
+    jle .tce_vrd_ok
+    cmp al, 'a'
+    jb .tce_vrd_done
+    cmp al, 'z'
+    ja .tce_vrd_done
+.tce_vrd_ok:
+    mov [di], al
+    inc si
+    inc di
+    dec cx
+    jnz .tce_vrd
+.tce_vrd_done:
+    mov byte [di], 0
+    call tc_load_var
+.tce_op:
+.tce_osp:
+    cmp byte [si], ' '
+    jne .tce_onsp
+    inc si
+    jmp .tce_osp
+.tce_onsp:
+    cmp byte [si], '+'
+    je .tce_add
+    cmp byte [si], '-'
+    je .tce_sub
+    cmp byte [si], '*'
+    je .tce_mul
+    pop cx
+    pop bx
+    ret
+.tce_add:
+    inc si
+    push ax
+    call wm_tc_eval
+    pop bx
+    add ax, bx
+    pop cx
+    pop bx
+    ret
+.tce_sub:
+    inc si
+    push ax
+    call wm_tc_eval
+    pop bx
+    sub bx, ax
+    mov ax, bx
+    pop cx
+    pop bx
+    ret
+.tce_mul:
+    inc si
+    push ax
+    call wm_tc_eval
+    pop bx
+    imul ax, bx
+    pop cx
+    pop bx
+    ret
+
+; --- tc_cmpstr: compare [tc_tok] with [DI], ZF=1 if equal ---
+tc_cmpstr:
+    push si
+    push di
+    push bx
+    mov si, tc_tok
+.tcs_l:
+    mov al, [si]
+    mov bl, [di]
+    cmp al, bl
+    jne .tcs_ne
+    test al, al
+    jz .tcs_eq
+    inc si
+    inc di
+    jmp .tcs_l
+.tcs_eq:
+    pop bx
+    pop di
+    pop si
+    xor ax, ax      ; ZF=1
+    ret
+.tcs_ne:
+    pop bx
+    pop di
+    pop si
+    or al, 1        ; ZF=0
+    ret
+
+; --- tc_store_var: store AX in variable named [tc_tok] ---
+tc_store_var:
+    mov [tc_stv_val], ax
+    push bx
+    push cx
+    push si
+    push di
+    mov bx, tc_vars
+    xor cx, cx
+.tsv_l:
+    cmp cx, TC_VAR_SLOTS
+    jae .tsv_new
+    push bx
+    push cx
+    mov si, tc_tok
+    mov di, bx
+.tsv_cmp:
+    mov al, [si]
+    cmp al, [di]
+    jne .tsv_no
+    test al, al
+    jz .tsv_found
+    inc si
+    inc di
+    jmp .tsv_cmp
+.tsv_no:
+    pop cx
+    pop bx
+    add bx, TC_VAR_SIZE
+    inc cx
+    jmp .tsv_l
+.tsv_found:
+    pop cx
+    pop bx
+    add bx, TC_VAR_NLEN
+    mov ax, [tc_stv_val]
+    mov [bx], ax
+    pop di
+    pop si
+    pop cx
+    pop bx
+    ret
+.tsv_new:
+    mov bx, tc_vars
+    xor cx, cx
+.tsv_el:
+    cmp cx, TC_VAR_SLOTS
+    jae .tsv_fail
+    cmp byte [bx], 0
+    je .tsv_got
+    add bx, TC_VAR_SIZE
+    inc cx
+    jmp .tsv_el
+.tsv_got:
+    mov si, tc_tok
+    mov di, bx
+    mov cx, TC_VAR_NLEN
+.tsv_cp:
+    mov al, [si]
+    mov [di], al
+    test al, al
+    jz .tsv_cp_done
+    inc si
+    inc di
+    dec cx
+    jnz .tsv_cp
+.tsv_cp_done:
+    add bx, TC_VAR_NLEN
+    mov ax, [tc_stv_val]
+    mov [bx], ax
+    pop di
+    pop si
+    pop cx
+    pop bx
+    ret
+.tsv_fail:
+    pop di
+    pop si
+    pop cx
+    pop bx
+    ret
+
+; --- tc_load_var: AX = value of variable named [tc_tok2] (0 if not found) ---
+tc_load_var:
+    push bx
+    push cx
+    push si
+    push di
+    mov bx, tc_vars
+    xor cx, cx
+.tlv_l:
+    cmp cx, TC_VAR_SLOTS
+    jae .tlv_not
+    push bx
+    push cx
+    mov si, tc_tok2
+    mov di, bx
+.tlv_cmp:
+    mov al, [si]
+    cmp al, [di]
+    jne .tlv_no
+    test al, al
+    jz .tlv_found
+    inc si
+    inc di
+    jmp .tlv_cmp
+.tlv_no:
+    pop cx
+    pop bx
+    add bx, TC_VAR_SIZE
+    inc cx
+    jmp .tlv_l
+.tlv_found:
+    pop cx
+    pop bx
+    add bx, TC_VAR_NLEN
+    mov ax, [bx]
+    pop di
+    pop si
+    pop cx
+    pop bx
+    ret
+.tlv_not:
+    xor ax, ax
+    pop di
+    pop si
+    pop cx
+    pop bx
+    ret
+
+; --- tc_out_char: append AL to tc_out_buf ---
+tc_out_char:
+    push bx
+    movzx bx, word [tc_out_len]
+    cmp bx, 94
+    jae .toc_done
+    mov [tc_out_buf + bx], al
+    inc word [tc_out_len]
+.toc_done:
+    pop bx
+    ret
+
+; --- tc_out_newline: append LF if buffer non-empty and last != LF ---
+tc_out_newline:
+    push ax
+    push bx
+    movzx bx, word [tc_out_len]
+    test bx, bx
+    jz .ton_done
+    dec bx
+    cmp byte [tc_out_buf + bx], 0x0A
+    je .ton_done
+    mov al, 0x0A
+    call tc_out_char
+.ton_done:
+    pop bx
+    pop ax
+    ret
+
+; --- tc_out_num: convert AX to decimal string and append ---
+tc_out_num:
+    push ax
+    push bx
+    push cx
+    push dx
+    test ax, ax
+    jns .tonum_pos
+    push ax
+    mov al, '-'
+    call tc_out_char
+    pop ax
+    neg ax
+.tonum_pos:
+    mov bx, 10
+    xor cx, cx
+.tonum_d:
+    xor dx, dx
+    div bx
+    push dx
+    inc cx
+    test ax, ax
+    jnz .tonum_d
+.tonum_p:
+    pop dx
+    mov al, dl
+    add al, '0'
+    call tc_out_char
+    dec cx
+    jnz .tonum_p
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; --- tc_show_output: show tc_out_buf in overlay, wait for key ---
+tc_show_output:
+    pusha
+    ; background box x=30,y=48,w=260,h=104
+    mov ax, 30
+    mov bx, 48
+    mov cx, 260
+    mov dx, 104
+    mov bp, GC_SPOTBG
+    call gd_fillrect
+    mov ax, 30
+    mov bx, 48
+    mov cx, 260
+    mov dx, 104
+    mov bp, GC_DOCKBD
+    call gfx_box
+    ; header at row 6, col 4
+    mov ah, 0x02
+    xor bh, bh
+    mov dh, 6
+    mov dl, 4
+    int 0x10
+    mov si, tc_str_hdr
+    call gd_wstr
+    ; output lines starting at row 8
+    mov si, tc_out_buf
+    mov dh, 8
+    mov dl, 4
+.tso_check:
+    cmp byte [si], 0
+    je .tso_wait
+    mov ah, 0x02
+    xor bh, bh
+    int 0x10
+.tso_char:
+    mov al, [si]
+    test al, al
+    jz .tso_wait
+    cmp al, 0x0A
+    je .tso_nl
+    mov ah, 0x09
+    xor bh, bh
+    mov bl, GC_SPOTTX
+    mov cx, 1
+    int 0x10
+    inc dl
+    mov ah, 0x02
+    xor bh, bh
+    int 0x10
+    inc si
+    jmp .tso_char
+.tso_nl:
+    inc si
+    inc dh
+    cmp dh, 18
+    jae .tso_wait
+    mov dl, 4
+    jmp .tso_check
+.tso_wait:
+    mov ah, 0x02
+    xor bh, bh
+    mov dh, 19
+    mov dl, 4
+    int 0x10
+    mov si, tc_str_anykey
+    call gd_wstr
+    xor ax, ax
+    int 0x16
+    mov byte [wm_dirty], 1
+    popa
+    ret
+
+; --- as_draw: DI -> window record; App Store content ---
+as_draw:
+    pusha
+    mov ax, [di+2]
+    add ax, WTB_H + 2
+    shr ax, 3
+    cmp ax, 23
+    jle .asd_row_ok
+    mov ax, 23
+.asd_row_ok:
+    mov dh, al
+    mov ax, [di+0]
+    add ax, 2
+    shr ax, 3
+    cmp ax, 38
+    jle .asd_col_ok
+    mov ax, 38
+.asd_col_ok:
+    mov dl, al
+    ; row 0: header
+    mov ah, 0x02
+    xor bh, bh
+    int 0x10
+    mov si, as_str_hdr
+    call gd_wstr
+    inc dh
+    mov ah, 0x02
+    xor bh, bh
+    int 0x10
+    mov si, as_str_fm
+    call gd_wstr
+    inc dh
+    mov ah, 0x02
+    xor bh, bh
+    int 0x10
+    mov si, as_str_te
+    call gd_wstr
+    inc dh
+    mov ah, 0x02
+    xor bh, bh
+    int 0x10
+    mov si, as_str_sn
+    call gd_wstr
+    inc dh
+    mov ah, 0x02
+    xor bh, bh
+    int 0x10
+    mov si, as_str_pt
+    call gd_wstr
+    popa
+    ret
+
+; --- tc_draw: DI -> window record; Tommy's C code editor ---
+tc_draw:
+    call te_draw        ; same as text editor (F5 to run)
     ret
 
 ; --- gfx_spotlight: centered input overlay for running commands ---
@@ -10618,6 +11477,9 @@ wm_drag_ox      dw 0
 wm_drag_oy      dw 0
 wm_next_file    db 0
 wm_key_tmp      db 0            ; temp storage for key in wm_key_dispatch
+wm_scan_tmp     db 0            ; scan code for F-key detection
+wm_last_ms_x    dw 0xFFFF       ; last cursor x drawn (0xFFFF = force draw)
+wm_last_ms_y    dw 0xFFFF       ; last cursor y drawn
 
 ; Window records: MAX_WNDS * WND_SIZE bytes
 ; Each record: [0]=x [2]=y [4]=w [6]=h [8]=saved_x [10]=saved_y
@@ -10633,6 +11495,8 @@ vfs_count       db 0
 ; Window title strings
 wm_str_files    db 'File Manager', 0
 wm_str_edit     db 'Text Editor', 0
+wm_str_store    db 'App Store', 0
+wm_str_code     db "Tommy's C", 0
 
 ; File manager header string
 fm_str_hdr      db 'Files:', 0
@@ -10645,13 +11509,38 @@ wm_fn_scratch   db 'scratch.txt', 0
 ; readme.txt default content (null-terminated)
 wm_fc_readme    db 'Tommy OS v2.02', 0x0A
                 db '--------------', 0x0A
-                db 'Click Folder to browse files.', 0x0A
-                db 'Click Doc to open an editor.', 0x0A
-                db 'Drag title bar to move a window.', 0x0A
-                db 'Drag bottom-right corner to resize.', 0x0A
-                db 'X closes  []  maximises.', 0x0A
-                db 'ESC closes the focused window.', 0x0A
+                db 'Folder  - browse files', 0x0A
+                db 'Doc     - text editor', 0x0A
+                db "Code    - Tommy's C IDE", 0x0A
+                db 'Store   - app launcher', 0x0A
+                db 'Drag title bar to move.', 0x0A
+                db 'Drag corner to resize.', 0x0A
+                db 'X=close  []=maximise', 0x0A
+                db 'ESC=close focused window', 0x0A
+                db "F5=run Tommy's C code", 0x0A
                 db 0
+
+; ---- App Store strings ----
+as_str_hdr      db 'Available Apps:', 0
+as_str_fm       db '  [>] File Manager', 0
+as_str_te       db '  [>] Text Editor', 0
+as_str_sn       db '  [>] Snake Game', 0
+as_str_pt       db '  [>] Paint Mode', 0
+
+; ---- Tommy's C interpreter ----
+TC_VAR_SLOTS    equ 4
+TC_VAR_NLEN     equ 8
+TC_VAR_SIZE     equ 10          ; name(8) + int16 value(2)
+tc_kw_print     db 'print', 0
+tc_kw_var       db 'var', 0
+tc_tok          times 10 db 0   ; first-word / assignment-target token
+tc_tok2         times 10 db 0   ; expression variable name buffer
+tc_stv_val      dw 0            ; tc_store_var scratch
+tc_vars         times (TC_VAR_SLOTS * TC_VAR_SIZE) db 0
+tc_out_buf      times 96 db 0   ; interpreter output (null-terminated)
+tc_out_len      dw 0
+tc_str_hdr      db "Tommy's C Output", 0
+tc_str_anykey   db '  Press any key...', 0
 
 ; Pad to fill exactly 125 sectors (must match boot.asm)
 times (125*512)-($-$$) db 0
