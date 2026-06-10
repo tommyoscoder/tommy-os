@@ -1,5 +1,5 @@
 # =====================================================================
-# Tommy OS v2.02 - PowerShell USB / disk installer
+# Tommy OS v2.03 - PowerShell USB / disk installer
 #
 # Lists physical drives via CIM (modern, replaces WMIC), asks for a
 # selection, requires the user to type YES, then writes tommy_os_v2.img
@@ -40,7 +40,7 @@ if (-not (Test-Path $imgPath)) {
 }
 
 Write-Host ""
-Write-Host "=== Tommy OS v2.02 installer ===" -ForegroundColor Cyan
+Write-Host "=== Tommy OS v2.03 installer ===" -ForegroundColor Cyan
 Write-Host "Image: $imgPath"
 Write-Host ""
 Write-Host "Detected physical drives:" -ForegroundColor Cyan
@@ -95,7 +95,7 @@ if ($target.Index -eq 0) {
     exit 1
 }
 
-$confirm = Read-Host "Type YES (uppercase) to ERASE this drive and install Tommy OS v2.02"
+$confirm = Read-Host "Type YES (uppercase) to ERASE this drive and install Tommy OS v2.03"
 if ($confirm -cne "YES") {
     Write-Host "Cancelled." -ForegroundColor Cyan
     exit 0

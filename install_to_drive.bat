@@ -1,7 +1,7 @@
 @echo off
 setlocal
 echo ==================================================
-echo   Tommy OS v2.02  -  Install to physical drive
+echo   Tommy OS v2.03  -  Install to physical drive
 echo   !! WARNING: this ERASES the chosen drive !!
 echo ==================================================
 echo.
