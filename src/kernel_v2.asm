@@ -8848,7 +8848,7 @@ gd_2gfx:
     ret
 
 ;=======================================================
-; WINDOW MANAGER  v2.01.1
+; WINDOW MANAGER  v2.02
 ;=======================================================
 WND_SIZE  equ 24
 MAX_WNDS  equ 3
@@ -10597,7 +10597,7 @@ gd_pal_dat:
 
 ; ---- GFX Desktop strings ----
 gd_str_brand    db 'Tommy_OS', 0
-gd_str_ver      db 'v 2.01', 0
+gd_str_ver      db 'v 2.02', 0
 gd_str_nortc    db '--:--:--', 0
 gd_str_spot     db '  Run command (Enter=exec  ESC=cancel)', 0
 
@@ -10643,7 +10643,7 @@ wm_fn_notes     db 'notes.txt', 0
 wm_fn_scratch   db 'scratch.txt', 0
 
 ; readme.txt default content (null-terminated)
-wm_fc_readme    db 'Tommy OS v2.01', 0x0A
+wm_fc_readme    db 'Tommy OS v2.02', 0x0A
                 db '--------------', 0x0A
                 db 'Click Folder to browse files.', 0x0A
                 db 'Click Doc to open an editor.', 0x0A
