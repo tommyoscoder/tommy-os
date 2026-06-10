@@ -8739,95 +8739,84 @@ gfx_desktop_main:
     mov ax, 0x0013
     int 0x10
     call mouse_init
+    call wm_init_vfs
     call gfx_desk_pal
     call gfx_desk_draw
     call mouse_draw_cursor
 gfx_dsk_loop:
     call mouse_restore_bg
     call mouse_poll
+
+    ; ongoing window drag
+    cmp byte [wm_drag_wnd], 0xFF
+    je .wdl_chk_rsz
+    test byte [ms_btn], 0x01
+    jz .wdl_end_drag
+    call wm_do_drag
+    jmp .wdl_aft
+.wdl_end_drag:
+    mov byte [wm_drag_wnd], 0xFF
+    mov byte [wm_dirty], 1
+    jmp .wdl_aft
+.wdl_chk_rsz:
+    cmp byte [wm_rsz_wnd], 0xFF
+    je .wdl_newclk
+    test byte [ms_btn], 0x01
+    jz .wdl_end_rsz
+    call wm_do_resize
+    jmp .wdl_aft
+.wdl_end_rsz:
+    mov byte [wm_rsz_wnd], 0xFF
+    mov byte [wm_dirty], 1
+    jmp .wdl_aft
+.wdl_newclk:
+    test byte [ms_btn], 0x01
+    jz .wdl_btnup
+    cmp byte [ms_lbtn_prev], 1
+    je .wdl_aft
+    mov ax, [ms_x]
+    mov bx, [ms_y]
+    call wm_hit_test
+    test ah, ah
+    jnz .wdl_hitwin
+    call wm_dock_click
+    jmp .wdl_aft
+.wdl_hitwin:
+    call wm_process_click
+    jmp .wdl_aft
+.wdl_btnup:
+    mov byte [ms_lbtn_prev], 0
+.wdl_aft:
+    test byte [ms_btn], 0x01
+    jz .wdl_clk
+    mov byte [ms_lbtn_prev], 1
+.wdl_clk:
     call gfx_desk_clk
+    cmp byte [wm_dirty], 0
+    je .wdl_nd
+    mov byte [wm_dirty], 0
+    call gfx_desk_draw
+    call wm_draw_all
+.wdl_nd:
     call mouse_draw_cursor
-    call gd_dock_click
     mov ah, 0x01
     int 0x16
     jz gfx_dsk_loop
     mov ah, 0x00
     int 0x16
-    cmp al, '1'
-    je .gdt_term
-    cmp al, 't'
-    je .gdt_term
-    cmp al, 'T'
-    je .gdt_term
-    cmp al, '2'
-    je .gdt_edit
-    cmp al, 'e'
-    je .gdt_edit
-    cmp al, 'E'
-    je .gdt_edit
-    cmp al, '3'
-    je .gdt_grfx
-    cmp al, 'g'
-    je .gdt_grfx
-    cmp al, 'G'
-    je .gdt_grfx
-    cmp al, '4'
-    je .gdt_snake
-    cmp al, 's'
-    je .gdt_snake
-    cmp al, 'S'
-    je .gdt_snake
-    cmp al, '5'
-    je .gdt_about
-    cmp al, 'a'
-    je .gdt_about
-    cmp al, 'A'
-    je .gdt_about
+    cmp byte [wm_focus_wnd], 0xFF
+    je .wdl_glbl
+    call wm_key_dispatch
+    jmp gfx_dsk_loop
+.wdl_glbl:
     cmp al, 0x1B
     je gfx_dsk_loop
     cmp al, 0x20
-    jae .gdt_spot
-    jmp gfx_dsk_loop
-.gdt_term:
-    call mouse_restore_bg
-    call gd_2text
-    call shell_main
-    call gd_2gfx
-    jmp gfx_dsk_loop
-.gdt_edit:
-    call mouse_restore_bg
-    call gd_2text
-    mov byte [desk_state], DS_EDITOR
-    call clrscr
-    call draw_titlebar
-    call draw_win_titlebar_editor
-    call draw_statusbar
-    call text_editor
-    call gd_2gfx
-    jmp gfx_dsk_loop
-.gdt_grfx:
-    call mouse_restore_bg
-    call gd_2text
-    call graphics_mode
-    call gd_2gfx
-    jmp gfx_dsk_loop
-.gdt_snake:
-    call mouse_restore_bg
-    call gd_2text
-    call gfx_app_snake_entry
-    call gd_2gfx
-    jmp gfx_dsk_loop
-.gdt_about:
-    call mouse_restore_bg
-    call gd_2text
-    mov byte [desk_state], DS_ABOUT
-    call desktop_show_about
-    call gd_2gfx
-    jmp gfx_dsk_loop
-.gdt_spot:
+    jb gfx_dsk_loop
     call mouse_restore_bg
     call gfx_spotlight
     call gfx_desk_draw
+    call wm_draw_all
     call mouse_draw_cursor
     jmp gfx_dsk_loop
 
@@ -8858,65 +8847,1082 @@ gd_2gfx:
     pop ax
     ret
 
-; --- gd_dock_click: handle left-click on dock icons ---
-gd_dock_click:
-    mov al, [ms_btn]
-    test al, 0x01
-    jz .dc_up
-    cmp byte [ms_lbtn_prev], 1
-    je .dc_held
+;=======================================================
+; WINDOW MANAGER  v2.01.1
+;=======================================================
+WND_SIZE  equ 24
+MAX_WNDS  equ 3
+WF_OPEN   equ 0x01
+WF_MAX    equ 0x02
+WT_FILES  equ 1
+WT_EDIT   equ 2
+WTB_H     equ 11
+WMW_MIN_W equ 90
+WMW_MIN_H equ 50
+WH_TITLE  equ 1
+WH_CLOSE  equ 2
+WH_MAX    equ 3
+WH_RESIZE equ 4
+WH_CONT   equ 5
+VFS_MAX   equ 3
+VFS_NLEN  equ 14
+VFS_BSIZ  equ 350
+
+; --- wm_dock_click: handle dock clicks in windowed mode ---
+wm_dock_click:
+    pusha
     mov ax, [ms_x]
     mov bx, [ms_y]
-    cmp bx, 150
-    jl .dc_up
+    cmp bx, 148
+    jl .wdc_ret
     cmp bx, 192
-    jg .dc_up
-    ; Folder icon  x=66..122
+    jg .wdc_ret
+    ; Folder icon x=66..122 -> file manager
     cmp ax, 66
-    jl .dc_d
+    jl .wdc_doc
     cmp ax, 122
-    jg .dc_d
-    mov byte [ms_lbtn_prev], 1
-    call mouse_restore_bg
-    call gd_2text
-    call shell_main
-    call gd_2gfx
-    ret
-.dc_d:
-    ; Doc icon  x=128..192
+    jg .wdc_doc
+    mov al, WT_FILES
+    mov ah, 0
+    call wm_open_wnd
+    jmp .wdc_ret
+.wdc_doc:
+    ; Doc icon x=128..192 -> text editor
     cmp ax, 128
-    jl .dc_g
+    jl .wdc_gear
     cmp ax, 192
-    jg .dc_g
-    mov byte [ms_lbtn_prev], 1
-    call mouse_restore_bg
-    call gd_2text
-    mov byte [desk_state], DS_EDITOR
-    call clrscr
-    call draw_titlebar
-    call draw_win_titlebar_editor
-    call draw_statusbar
-    call text_editor
-    call gd_2gfx
-    ret
-.dc_g:
-    ; Gear icon  x=198..254
+    jg .wdc_gear
+    mov al, WT_EDIT
+    mov ah, 0xFF
+    call wm_open_wnd
+    jmp .wdc_ret
+.wdc_gear:
+    ; Gear x=198..254 -> about (text mode)
     cmp ax, 198
-    jl .dc_up
+    jl .wdc_ret
     cmp ax, 254
-    jg .dc_up
-    mov byte [ms_lbtn_prev], 1
+    jg .wdc_ret
+    popa
     call mouse_restore_bg
     call gd_2text
     mov byte [desk_state], DS_ABOUT
     call desktop_show_about
     call gd_2gfx
+    mov byte [wm_dirty], 1
     ret
-.dc_held:
-    mov byte [ms_lbtn_prev], 1
+.wdc_ret:
+    popa
     ret
-.dc_up:
-    mov byte [ms_lbtn_prev], 0
+
+; --- wm_open_wnd: AL=type  AH=file_idx (0xFF=auto-alloc) ---
+wm_open_wnd:
+    pusha
+    mov cl, al          ; CL = type
+    mov ch, ah          ; CH = file idx hint
+    ; find free window slot
+    xor bx, bx
+.wop_l:
+    cmp bx, MAX_WNDS
+    jae .wop_done
+    mov di, bx
+    imul di, di, WND_SIZE
+    add di, windows
+    test byte [di+17], WF_OPEN
+    jz .wop_got
+    inc bx
+    jmp .wop_l
+.wop_got:
+    ; stagger position: x=10+bx*14, y=18+bx*14
+    mov ax, bx
+    imul ax, ax, 14
+    add ax, 10
+    mov [di+0], ax
+    mov ax, bx
+    imul ax, ax, 14
+    add ax, 18
+    mov [di+2], ax
+    cmp cl, WT_FILES
+    je .wop_files
+    ; WT_EDIT
+    mov word [di+4], 200
+    mov word [di+6], 110
+    mov word [di+18], wm_str_edit
+    ; assign VFS file index
+    cmp ch, 0xFF
+    jne .wop_use_fi
+    movzx ax, byte [wm_next_file]
+    mov [di+20], ax
+    inc byte [wm_next_file]
+    mov al, [wm_next_file]
+    cmp al, VFS_MAX
+    jb .wop_geom
+    mov byte [wm_next_file], 0
+    jmp .wop_geom
+.wop_use_fi:
+    movzx ax, ch
+    mov [di+20], ax
+    jmp .wop_geom
+.wop_files:
+    mov word [di+4], 180
+    mov word [di+6], 110
+    mov word [di+18], wm_str_files
+    mov word [di+20], 0
+.wop_geom:
+    ; save restore coords (fields 8-15 = saved x,y,w,h)
+    mov ax, [di+0]
+    mov [di+8], ax
+    mov ax, [di+2]
+    mov [di+10], ax
+    mov ax, [di+4]
+    mov [di+12], ax
+    mov ax, [di+6]
+    mov [di+14], ax
+    mov [di+16], cl     ; type
+    mov byte [di+17], WF_OPEN
+    mov [wm_focus_wnd], bl
+    mov byte [wm_dirty], 1
+.wop_done:
+    popa
+    ret
+
+; --- wm_close_wnd: BL=window index ---
+wm_close_wnd:
+    pusha
+    cmp bl, MAX_WNDS
+    jae .wcl_done
+    movzx di, bl
+    imul di, di, WND_SIZE
+    add di, windows
+    mov byte [di+17], 0
+    ; update focus
+    movzx ax, byte [wm_focus_wnd]
+    cmp al, bl
+    jne .wcl_done
+    mov byte [wm_focus_wnd], 0xFF
+    xor cx, cx
+.wcl_fl:
+    cmp cx, MAX_WNDS
+    jae .wcl_done
+    movzx si, cl
+    imul si, si, WND_SIZE
+    add si, windows
+    test byte [si+17], WF_OPEN
+    jz .wcl_fnx
+    mov [wm_focus_wnd], cl
+    jmp .wcl_done
+.wcl_fnx:
+    inc cx
+    jmp .wcl_fl
+.wcl_done:
+    mov byte [wm_dirty], 1
+    popa
+    ret
+
+; --- wm_toggle_max: BL=window index ---
+wm_toggle_max:
+    pusha
+    movzx di, bl
+    imul di, di, WND_SIZE
+    add di, windows
+    test byte [di+17], WF_MAX
+    jnz .wtm_restore
+    ; save current, go fullscreen desktop area
+    mov ax, [di+0]
+    mov [di+8], ax
+    mov ax, [di+2]
+    mov [di+10], ax
+    mov ax, [di+4]
+    mov [di+12], ax
+    mov ax, [di+6]
+    mov [di+14], ax
+    mov word [di+0], 0
+    mov word [di+2], 15
+    mov word [di+4], 320
+    mov word [di+6], 133
+    or byte [di+17], WF_MAX
+    jmp .wtm_done
+.wtm_restore:
+    mov ax, [di+8]
+    mov [di+0], ax
+    mov ax, [di+10]
+    mov [di+2], ax
+    mov ax, [di+12]
+    mov [di+4], ax
+    mov ax, [di+14]
+    mov [di+6], ax
+    and byte [di+17], ~WF_MAX
+.wtm_done:
+    mov byte [wm_dirty], 1
+    popa
+    ret
+
+; --- wm_hit_test: AX=x BX=y  ->  AH=area AL=wndidx (0xFF=none) ---
+; Tests highest index first (topmost window).
+wm_hit_test:
+    push cx
+    push dx
+    push si
+    push di
+    mov cx, MAX_WNDS - 1
+.wht_l:
+    movzx di, cl
+    imul di, di, WND_SIZE
+    add di, windows
+    test byte [di+17], WF_OPEN
+    jz .wht_next
+    ; bounding box check
+    mov si, [di+0]          ; wx
+    cmp ax, si
+    jl .wht_next
+    mov dx, [di+4]
+    add dx, si
+    cmp ax, dx
+    jg .wht_next
+    mov si, [di+2]          ; wy
+    cmp bx, si
+    jl .wht_next
+    mov dx, [di+6]
+    add dx, si
+    cmp bx, dx
+    jg .wht_next
+    ; inside - check close button (wx+ww-10 .. wx+ww-2,  wy+2..wy+10)
+    mov dx, [di+0]
+    add dx, [di+4]
+    sub dx, 10
+    cmp ax, dx
+    jl .wht_chk_max
+    mov dx, [di+2]
+    add dx, 2
+    cmp bx, dx
+    jl .wht_chk_title
+    add dx, 8
+    cmp bx, dx
+    jg .wht_chk_title
+    mov ah, WH_CLOSE
+    mov al, cl
+    jmp .wht_ret
+.wht_chk_max:
+    ; max button: wx+ww-20 .. wx+ww-12,  wy+2..wy+10
+    mov dx, [di+0]
+    add dx, [di+4]
+    sub dx, 20
+    cmp ax, dx
+    jl .wht_chk_title
+    add dx, 8
+    cmp ax, dx
+    jg .wht_chk_title
+    mov dx, [di+2]
+    add dx, 2
+    cmp bx, dx
+    jl .wht_chk_title
+    add dx, 8
+    cmp bx, dx
+    jg .wht_chk_title
+    mov ah, WH_MAX
+    mov al, cl
+    jmp .wht_ret
+.wht_chk_title:
+    mov dx, [di+2]
+    add dx, WTB_H
+    cmp bx, dx
+    jg .wht_chk_resize
+    mov ah, WH_TITLE
+    mov al, cl
+    jmp .wht_ret
+.wht_chk_resize:
+    ; resize handle: bottom-right 10x10
+    mov dx, [di+0]
+    add dx, [di+4]
+    sub dx, 10
+    cmp ax, dx
+    jl .wht_cont
+    mov dx, [di+2]
+    add dx, [di+6]
+    sub dx, 10
+    cmp bx, dx
+    jl .wht_cont
+    mov ah, WH_RESIZE
+    mov al, cl
+    jmp .wht_ret
+.wht_cont:
+    mov ah, WH_CONT
+    mov al, cl
+    jmp .wht_ret
+.wht_next:
+    test cx, cx
+    jz .wht_miss
+    dec cx
+    jmp .wht_l
+.wht_miss:
+    xor ah, ah
+    mov al, 0xFF
+.wht_ret:
+    pop di
+    pop si
+    pop dx
+    pop cx
+    ret
+
+; --- wm_process_click: AH=area AL=wndidx ---
+wm_process_click:
+    pusha
+    mov bl, al
+    mov [wm_focus_wnd], bl
+    mov byte [wm_dirty], 1
+    cmp ah, WH_CLOSE
+    je .wpc_close
+    cmp ah, WH_MAX
+    je .wpc_max
+    cmp ah, WH_TITLE
+    je .wpc_drag
+    cmp ah, WH_RESIZE
+    je .wpc_resize
+    ; WH_CONT
+    call wm_cont_click
+    jmp .wpc_done
+.wpc_close:
+    call wm_close_wnd
+    jmp .wpc_done
+.wpc_max:
+    call wm_toggle_max
+    jmp .wpc_done
+.wpc_drag:
+    mov [wm_drag_wnd], bl
+    movzx di, bl
+    imul di, di, WND_SIZE
+    add di, windows
+    mov ax, [ms_x]
+    sub ax, [di+0]
+    mov [wm_drag_ox], ax
+    mov ax, [ms_y]
+    sub ax, [di+2]
+    mov [wm_drag_oy], ax
+    jmp .wpc_done
+.wpc_resize:
+    mov [wm_rsz_wnd], bl
+.wpc_done:
+    popa
+    ret
+
+; --- wm_do_drag: move dragging window to follow mouse ---
+wm_do_drag:
+    pusha
+    movzx bx, byte [wm_drag_wnd]
+    movzx di, bl
+    imul di, di, WND_SIZE
+    add di, windows
+    ; new_x = ms_x - drag_ox, clamped 0..(319-w)
+    mov ax, [ms_x]
+    sub ax, [wm_drag_ox]
+    cmp ax, 0
+    jge .wdd_xok
+    xor ax, ax
+.wdd_xok:
+    mov cx, 319
+    sub cx, [di+4]
+    cmp ax, cx
+    jle .wdd_xfin
+    mov ax, cx
+.wdd_xfin:
+    mov [di+0], ax
+    ; new_y = ms_y - drag_oy, clamped 15..(147-h)
+    mov ax, [ms_y]
+    sub ax, [wm_drag_oy]
+    cmp ax, 15
+    jge .wdd_yok
+    mov ax, 15
+.wdd_yok:
+    mov cx, 147
+    sub cx, [di+6]
+    cmp ax, cx
+    jle .wdd_yfin
+    mov ax, cx
+.wdd_yfin:
+    mov [di+2], ax
+    mov byte [wm_dirty], 1
+    popa
+    ret
+
+; --- wm_do_resize: resize window by dragging bottom-right ---
+wm_do_resize:
+    pusha
+    movzx bx, byte [wm_rsz_wnd]
+    movzx di, bl
+    imul di, di, WND_SIZE
+    add di, windows
+    ; new_w = ms_x - wx, clamped WMW_MIN_W..(319-wx)
+    mov ax, [ms_x]
+    sub ax, [di+0]
+    cmp ax, WMW_MIN_W
+    jge .wdr_wok
+    mov ax, WMW_MIN_W
+.wdr_wok:
+    mov cx, 319
+    sub cx, [di+0]
+    cmp ax, cx
+    jle .wdr_wfin
+    mov ax, cx
+.wdr_wfin:
+    mov [di+4], ax
+    ; new_h = ms_y - wy, clamped WMW_MIN_H..(147-wy)
+    mov ax, [ms_y]
+    sub ax, [di+2]
+    cmp ax, WMW_MIN_H
+    jge .wdr_hok
+    mov ax, WMW_MIN_H
+.wdr_hok:
+    mov cx, 147
+    sub cx, [di+2]
+    cmp ax, cx
+    jle .wdr_hfin
+    mov ax, cx
+.wdr_hfin:
+    mov [di+6], ax
+    mov byte [wm_dirty], 1
+    popa
+    ret
+
+; --- wm_draw_all: draw all open windows back-to-front ---
+wm_draw_all:
+    push cx
+    push di
+    xor cx, cx
+.wda_l:
+    cmp cx, MAX_WNDS
+    jae .wda_done
+    movzx di, cl
+    imul di, di, WND_SIZE
+    add di, windows
+    test byte [di+17], WF_OPEN
+    jz .wda_next
+    call wm_draw_one
+.wda_next:
+    inc cx
+    jmp .wda_l
+.wda_done:
+    pop di
+    pop cx
+    ret
+
+; --- wm_draw_one: DI -> window record ---
+wm_draw_one:
+    pusha
+    ; content background fill
+    mov ax, [di+0]
+    mov bx, [di+2]
+    mov cx, [di+4]
+    mov dx, [di+6]
+    mov bp, GC_SPOTBG
+    call gd_fillrect
+    ; border
+    mov ax, [di+0]
+    mov bx, [di+2]
+    mov cx, [di+4]
+    mov dx, [di+6]
+    mov bp, GC_DOCKBD
+    call gfx_box
+    ; title bar fill - find this window's index to check focus
+    ; compute index: (DI - windows) / WND_SIZE
+    mov si, di
+    sub si, windows
+    xor cx, cx
+.wdo_idx:
+    cmp cx, MAX_WNDS
+    jae .wdo_idx_done
+    mov ax, cx
+    imul ax, ax, WND_SIZE
+    cmp ax, si
+    je .wdo_idx_done
+    inc cx
+    jmp .wdo_idx
+.wdo_idx_done:
+    ; CX = this window's index
+    movzx bp, byte [wm_focus_wnd]
+    cmp bp, cx
+    je .wdo_active_tb
+    mov bp, GC_DOCKBD     ; inactive title bar
+    jmp .wdo_tfill
+.wdo_active_tb:
+    mov bp, GC_TOPBAR     ; active title bar (dark)
+.wdo_tfill:
+    mov ax, [di+0]
+    mov bx, [di+2]
+    mov cx, [di+4]
+    mov dx, WTB_H
+    call gd_fillrect
+    ; title text via BIOS: row = (wy+2)/8, col = (wx+3)/8
+    mov ax, [di+2]
+    add ax, 2
+    shr ax, 3
+    cmp ax, 24
+    jle .wdo_row_ok
+    mov ax, 24
+.wdo_row_ok:
+    mov dh, al
+    mov ax, [di+0]
+    add ax, 3
+    shr ax, 3
+    cmp ax, 39
+    jle .wdo_col_ok
+    mov ax, 39
+.wdo_col_ok:
+    mov dl, al
+    mov ah, 0x02
+    xor bh, bh
+    int 0x10
+    ; write title string with BIOS
+    mov si, [di+18]
+    ; recompute this window's index from DI
+    mov bp, di
+    sub bp, windows
+    xor cx, cx
+.wdo_ci2:
+    cmp cx, MAX_WNDS
+    jae .wdo_ci2_done
+    mov ax, cx
+    imul ax, ax, WND_SIZE
+    cmp ax, bp
+    je .wdo_ci2_done
+    inc cx
+    jmp .wdo_ci2
+.wdo_ci2_done:
+    movzx bp, byte [wm_focus_wnd]
+    cmp bp, cx
+    je .wdo_tactive
+    mov bl, GC_ICON     ; inactive: near-white text
+    jmp .wdo_twrite
+.wdo_tactive:
+    mov bl, GC_TOPBAR   ; active: dark text on dark bar? use icon colour
+    mov bl, GC_ICON
+.wdo_twrite:
+.wdo_twl:
+    mov al, [si]
+    test al, al
+    jz .wdo_tdone
+    mov ah, 0x09
+    xor bh, bh
+    mov cx, 1
+    int 0x10
+    mov ah, 0x03
+    xor bh, bh
+    int 0x10
+    inc dl
+    cmp dl, 39
+    jl .wdo_tadv
+    mov dl, 39
+.wdo_tadv:
+    mov ah, 0x02
+    xor bh, bh
+    int 0x10
+    inc si
+    jmp .wdo_twl
+.wdo_tdone:
+    ; close button X at (wx+ww-10, wy+2)
+    mov ax, [di+0]
+    add ax, [di+4]
+    sub ax, 10
+    shr ax, 3
+    mov cl, al          ; col
+    mov ax, [di+2]
+    add ax, 2
+    shr ax, 3
+    mov ch, al          ; row
+    mov ah, 0x02
+    xor bh, bh
+    mov dh, ch
+    mov dl, cl
+    int 0x10
+    mov ah, 0x09
+    mov al, 'X'
+    xor bh, bh
+    mov bl, 28
+    mov cx, 1
+    int 0x10
+    ; max button square at (wx+ww-20, wy+2)
+    mov ax, [di+0]
+    add ax, [di+4]
+    sub ax, 20
+    shr ax, 3
+    mov cl, al
+    mov ax, [di+2]
+    add ax, 2
+    shr ax, 3
+    mov ch, al
+    mov ah, 0x02
+    xor bh, bh
+    mov dh, ch
+    mov dl, cl
+    int 0x10
+    mov ah, 0x09
+    mov al, 0xFE
+    xor bh, bh
+    mov bl, GC_DOCKBD
+    mov cx, 1
+    int 0x10
+    ; resize handle: 4x4 dot at bottom-right corner
+    mov ax, [di+0]
+    add ax, [di+4]
+    sub ax, 1           ; right edge x
+    push ax             ; save rx
+    mov bx, [di+2]
+    add bx, [di+6]
+    sub bx, 1           ; bottom edge y
+    pop cx              ; cx = rx, bx = ry
+    ; draw 4 pixels going up-left from corner
+    mov dx, bx
+    sub dx, 3           ; start row
+.wdo_rsz:
+    cmp dx, bx
+    jg .wdo_rsz_done
+    mov ax, cx
+    sub ax, 3           ; start col
+.wdo_rsz_c:
+    cmp ax, cx
+    jg .wdo_rsz_next
+    push cx
+    push bx
+    push dx
+    mov cx, ax
+    mov al, GC_DOCKBD
+    call gfx_putpixel
+    pop dx
+    pop bx
+    pop cx
+    inc ax
+    jmp .wdo_rsz_c
+.wdo_rsz_next:
+    inc dx
+    jmp .wdo_rsz
+.wdo_rsz_done:
+    ; draw window content
+    call wm_draw_content
+    popa
+    ret
+
+; --- wm_draw_content: DI -> window record ---
+wm_draw_content:
+    pusha
+    mov al, [di+16]
+    cmp al, WT_FILES
+    je .wdc_files
+    cmp al, WT_EDIT
+    je .wdc_edit
+    jmp .wdc_done
+.wdc_files:
+    call fm_draw
+    jmp .wdc_done
+.wdc_edit:
+    call te_draw
+.wdc_done:
+    popa
+    ret
+
+; --- fm_draw: DI -> window record; file manager content ---
+fm_draw:
+    pusha
+    ; content area starts at wy+WTB_H+1
+    mov ax, [di+2]
+    add ax, WTB_H + 2
+    shr ax, 3           ; to text rows
+    cmp ax, 23
+    jle .fm_row_ok
+    mov ax, 23
+.fm_row_ok:
+    mov dh, al          ; base text row
+    mov ax, [di+0]
+    add ax, 2
+    shr ax, 3
+    cmp ax, 38
+    jle .fm_col_ok
+    mov ax, 38
+.fm_col_ok:
+    mov dl, al          ; base text col
+    ; position cursor and write header
+    mov ah, 0x02
+    xor bh, bh
+    int 0x10
+    push di
+    mov si, fm_str_hdr
+    mov bl, GC_ICON
+.fm_hdr_l:
+    mov al, [si]
+    test al, al
+    jz .fm_hdr_done
+    mov ah, 0x09
+    xor bh, bh
+    mov cx, 1
+    int 0x10
+    mov ah, 0x03
+    xor bh, bh
+    int 0x10
+    inc dl
+    mov ah, 0x02
+    xor bh, bh
+    int 0x10
+    inc si
+    jmp .fm_hdr_l
+.fm_hdr_done:
+    pop di
+    ; list files
+    xor cx, cx
+.fm_l:
+    cmp cx, VFS_MAX
+    jae .fm_done
+    ; check if vfs slot has a name
+    push cx
+    movzx si, cl
+    imul si, si, VFS_NLEN
+    add si, vfs_names
+    mov al, [si]
+    test al, al
+    jnz .fm_has_file
+    ; empty slot - show placeholder
+    movzx ax, dh
+    add ax, cx
+    inc ax
+    cmp ax, 24
+    jge .fm_skip_entry
+    mov dh, al
+    mov ah, 0x02
+    xor bh, bh
+    int 0x10
+    mov ah, 0x09
+    mov al, '-'
+    xor bh, bh
+    mov bl, GC_DOCKBD
+    push cx
+    mov cx, 1
+    int 0x10
+    pop cx
+    jmp .fm_skip_entry
+.fm_has_file:
+    pop cx
+    push cx
+    ; compute row = base_row + 1 + file_index
+    movzx ax, dh
+    add ax, cx
+    inc ax
+    cmp ax, 24
+    jge .fm_skip_entry
+    mov dh, al
+    mov ah, 0x02
+    xor bh, bh
+    int 0x10
+    ; write filename (CX = file index)
+    push cx
+    movzx si, cl
+    imul si, si, VFS_NLEN
+    add si, vfs_names
+.fm_fn_l:
+    mov al, [si]
+    test al, al
+    jz .fm_fn_done
+    mov ah, 0x09
+    xor bh, bh
+    mov bl, GC_ICON
+    push si
+    mov cx, 1
+    int 0x10
+    pop si
+    mov ah, 0x03
+    xor bh, bh
+    int 0x10
+    inc dl
+    mov ah, 0x02
+    xor bh, bh
+    int 0x10
+    inc si
+    jmp .fm_fn_l
+.fm_fn_done:
+    pop cx
+.fm_skip_entry:
+    pop cx
+    inc cx
+    jmp .fm_l
+.fm_done:
+    popa
+    ret
+
+; --- te_draw: DI -> window record; text editor content ---
+te_draw:
+    pusha
+    ; compute content area top-left in text grid
+    mov ax, [di+2]
+    add ax, WTB_H + 2
+    shr ax, 3
+    cmp ax, 23
+    jle .te_row_ok
+    mov ax, 23
+.te_row_ok:
+    mov dh, al
+    mov ax, [di+0]
+    add ax, 2
+    shr ax, 3
+    cmp ax, 38
+    jle .te_col_ok
+    mov ax, 38
+.te_col_ok:
+    mov dl, al
+    mov ah, 0x02
+    xor bh, bh
+    int 0x10
+    ; get VFS index for this window
+    mov ax, [di+20]
+    cmp ax, VFS_MAX
+    jae .te_done
+    ; display buffer contents line by line
+    movzx si, al
+    imul si, si, VFS_BSIZ
+    add si, vfs_bufs
+    mov ch, dh          ; starting row
+    mov cl, dl          ; starting col
+    ; compute max rows = (wy+wh - (wy+WTB_H+2)) / 8
+    mov ax, [di+6]
+    sub ax, WTB_H + 2
+    shr ax, 3
+    cmp ax, 0
+    jle .te_done
+    mov bp, ax          ; max rows
+    xor bx, bx          ; char count in line
+.te_loop:
+    mov al, [si]
+    test al, al
+    jz .te_done
+    cmp al, 0x0A
+    je .te_newline
+    ; write char
+    push bp
+    push si
+    push bx
+    mov ah, 0x09
+    xor bh, bh
+    mov bl, GC_ICON
+    mov cx, 1
+    int 0x10
+    mov ah, 0x03
+    xor bh, bh
+    int 0x10
+    inc dl
+    ; check column wrap
+    mov ax, [di+0]
+    add ax, [di+4]
+    shr ax, 3
+    cmp ax, 40
+    jl .te_col_lim
+    mov ax, 40
+.te_col_lim:
+    cmp dl, al
+    jl .te_adv
+    ; wrap to next row
+    mov dl, cl
+    inc dh
+    dec bp
+    jle .te_done_restore
+.te_adv:
+    mov ah, 0x02
+    xor bh, bh
+    int 0x10
+    pop bx
+    pop si
+    pop bp
+    inc si
+    inc bx
+    jmp .te_loop
+.te_done_restore:
+    pop bx
+    pop si
+    pop bp
+    jmp .te_done
+.te_newline:
+    mov dl, cl
+    inc dh
+    dec bp
+    jle .te_done
+    mov ah, 0x02
+    xor bh, bh
+    int 0x10
+    inc si
+    xor bx, bx
+    jmp .te_loop
+.te_done:
+    popa
+    ret
+
+; --- te_key: DI -> window record, AL = keypress ---
+te_key:
+    pusha
+    mov [wm_key_tmp], al    ; save key BEFORE any register clobber
+    mov ax, [di+20]
+    cmp ax, VFS_MAX
+    jae .tk_done
+    mov al, [wm_key_tmp]    ; restore key
+    cmp al, 0x1B        ; ESC closes window
+    jne .tk_noesc
+    ; find window index and close
+    mov si, di
+    sub si, windows
+    xor cx, cx
+.tk_idx:
+    cmp cx, MAX_WNDS
+    jae .tk_done
+    mov ax, cx
+    imul ax, ax, WND_SIZE
+    cmp ax, si
+    je .tk_close
+    inc cx
+    jmp .tk_idx
+.tk_close:
+    mov bl, cl
+    call wm_close_wnd
+    jmp .tk_done
+.tk_noesc:
+    mov al, [wm_key_tmp]    ; ensure key is in AL for all checks below
+    cmp al, 0x08        ; backspace
+    jne .tk_noback
+    movzx si, byte [di+20]
+    imul si, si, VFS_BSIZ
+    add si, vfs_bufs
+    ; find end of buffer
+    mov cx, VFS_BSIZ - 1
+    xor bx, bx
+.tk_bsf:
+    cmp bx, cx
+    jge .tk_bs_end
+    cmp byte [si+bx], 0
+    je .tk_bs_end
+    inc bx
+    jmp .tk_bsf
+.tk_bs_end:
+    test bx, bx
+    jz .tk_done
+    dec bx
+    mov byte [si+bx], 0
+    mov byte [wm_dirty], 1
+    jmp .tk_done
+.tk_noback:
+    mov al, [wm_key_tmp]    ; restore key again
+    cmp al, 0x0D        ; Enter -> newline
+    jne .tk_norm
+    mov al, 0x0A
+.tk_norm:
+    ; skip non-printable (except newline)
+    cmp al, 0x0A
+    je .tk_append_now
+    cmp al, 0x20
+    jb .tk_done
+.tk_append_now:
+    ; append char to VFS buffer
+    movzx si, byte [di+20]
+    imul si, si, VFS_BSIZ
+    add si, vfs_bufs
+    mov cx, VFS_BSIZ - 2
+    xor bx, bx
+.tk_find_end:
+    cmp bx, cx
+    jge .tk_done        ; buffer full
+    cmp byte [si+bx], 0
+    je .tk_append
+    inc bx
+    jmp .tk_find_end
+.tk_append:
+    mov [si+bx], al
+    inc bx
+    mov byte [si+bx], 0
+    mov byte [wm_dirty], 1
+.tk_done:
+    popa
+    ret
+
+; --- wm_key_dispatch: AL=key, route to focused window ---
+wm_key_dispatch:
+    pusha
+    movzx bx, byte [wm_focus_wnd]
+    cmp bx, MAX_WNDS
+    jae .wkd_done
+    movzx di, bl
+    imul di, di, WND_SIZE
+    add di, windows
+    test byte [di+17], WF_OPEN
+    jz .wkd_done
+    ; ESC always closes focused window
+    cmp al, 0x1B
+    jne .wkd_type
+    call wm_close_wnd
+    jmp .wkd_done
+.wkd_type:
+    ; save key in temp var, then check window type
+    mov [wm_key_tmp], al
+    mov al, [di+16]
+    cmp al, WT_EDIT
+    jne .wkd_done
+    mov al, [wm_key_tmp]
+    call te_key
+.wkd_done:
+    popa
+    ret
+
+; --- wm_cont_click: handle click in window content area ---
+; AH=WH_CONT, AL=wndidx, BL=wndidx, ms_x/ms_y=click pos
+wm_cont_click:
+    pusha
+    movzx di, bl
+    imul di, di, WND_SIZE
+    add di, windows
+    ; currently just set dirty to show focus change
+    mov byte [wm_dirty], 1
+    popa
+    ret
+
+; --- wm_init_vfs: pre-populate VFS with default files ---
+wm_init_vfs:
+    pusha
+    push es
+    push ds
+    push cs
+    pop ds
+    push cs
+    pop es
+    ; file 0: "readme.txt"
+    mov di, vfs_names
+    mov si, wm_fn_readme
+.wiv_cp0:
+    lodsb
+    stosb
+    test al, al
+    jnz .wiv_cp0
+    ; readme content
+    mov di, vfs_bufs
+    mov si, wm_fc_readme
+.wiv_cc0:
+    lodsb
+    stosb
+    test al, al
+    jnz .wiv_cc0
+    ; file 1: "notes.txt" (empty)
+    mov di, vfs_names + VFS_NLEN
+    mov si, wm_fn_notes
+.wiv_cp1:
+    lodsb
+    stosb
+    test al, al
+    jnz .wiv_cp1
+    ; notes buffer already zero (BSS)
+    ; file 2: "scratch.txt" (empty)
+    mov di, vfs_names + VFS_NLEN*2
+    mov si, wm_fn_scratch
+.wiv_cp2:
+    lodsb
+    stosb
+    test al, al
+    jnz .wiv_cp2
+    mov byte [vfs_count], 3
+    pop ds
+    pop es
+    popa
+    ret
+
+; --- gd_dock_click: stub (replaced by wm_dock_click) ---
+gd_dock_click:
     ret
 
 ; --- gfx_desk_draw: composite all desktop layers ---
@@ -9602,6 +10608,50 @@ gd_scol         db 0
 
 ; ---- Clock throttle: last drawn second (0xFF = never drawn) ----
 gd_last_sec     db 0xFF
+
+; ---- Window Manager data ----
+wm_dirty        db 0            ; 1 = redraw needed
+wm_drag_wnd     db 0xFF         ; 0xFF = none
+wm_rsz_wnd      db 0xFF         ; 0xFF = none
+wm_focus_wnd    db 0xFF         ; 0xFF = none
+wm_drag_ox      dw 0
+wm_drag_oy      dw 0
+wm_next_file    db 0
+wm_key_tmp      db 0            ; temp storage for key in wm_key_dispatch
+
+; Window records: MAX_WNDS * WND_SIZE bytes
+; Each record: [0]=x [2]=y [4]=w [6]=h [8]=saved_x [10]=saved_y
+;              [12]=saved_w [14]=saved_h [16]=type [17]=flags
+;              [18]=title_ptr [20]=file_idx
+windows         times (3*24) db 0
+
+; VFS: 3 files, each with 14-byte name and 350-byte buffer
+vfs_names       times (3*14) db 0
+vfs_bufs        times (3*350) db 0
+vfs_count       db 0
+
+; Window title strings
+wm_str_files    db 'File Manager', 0
+wm_str_edit     db 'Text Editor', 0
+
+; File manager header string
+fm_str_hdr      db 'Files:', 0
+
+; VFS default filenames
+wm_fn_readme    db 'readme.txt', 0
+wm_fn_notes     db 'notes.txt', 0
+wm_fn_scratch   db 'scratch.txt', 0
+
+; readme.txt default content (null-terminated)
+wm_fc_readme    db 'Tommy OS v2.01', 0x0A
+                db '--------------', 0x0A
+                db 'Click Folder to browse files.', 0x0A
+                db 'Click Doc to open an editor.', 0x0A
+                db 'Drag title bar to move a window.', 0x0A
+                db 'Drag bottom-right corner to resize.', 0x0A
+                db 'X closes  []  maximises.', 0x0A
+                db 'ESC closes the focused window.', 0x0A
+                db 0
 
 ; Pad to fill exactly 125 sectors (must match boot.asm)
 times (125*512)-($-$$) db 0
